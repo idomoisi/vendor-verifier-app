@@ -108,6 +108,15 @@ def is_developer(email: str) -> bool:
     return email.lower() in _DEVELOPER_EMAILS
 
 
+def is_support_mode() -> bool:
+    """Developer-only preview of the Support UI (sidebar toggle)."""
+    return bool(st.session_state.get("support_mode", False))
+
+
+def effective_dev_mode(email: str) -> bool:
+    return is_developer(email) and not is_support_mode()
+
+
 @st.cache_resource(ttl=300)
 def cached_registry() -> list[str]:
     return load_vendor_registry()
@@ -473,7 +482,7 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
     grounded_label = sv["grounded_label"]
     official = sv["official"]
     enum = sv["enum"]
-    dev_mode = is_developer(get_current_user())
+    dev_mode = effective_dev_mode(get_current_user())
 
     verdict_icon = {"LEGIT": "✅", "SOFTWARE-ONLY": "❌", "SUSPICIOUS": "⚠️"}.get(verdict, "❓")
     confidence = result.get("confidence_score", "")
@@ -726,7 +735,21 @@ def main() -> None:
 
     with st.sidebar:
         _current_user = get_current_user()
-        st.caption(f"Logged in as: `{_current_user}` ({'Developer' if is_developer(_current_user) else 'Support'})")
+        _is_dev = is_developer(_current_user)
+        if _is_dev:
+            st.toggle(
+                "Support mode",
+                value=is_support_mode(),
+                key="support_mode",
+                help="Preview the simplified UI that Support users see.",
+            )
+        if _is_dev and is_support_mode():
+            _role = "Developer · Support preview"
+        elif _is_dev:
+            _role = "Developer"
+        else:
+            _role = "Support"
+        st.caption(f"Logged in as: `{_current_user}` ({_role})")
         st.subheader("Integrations")
         if st.button("Test GitHub Connection", use_container_width=True):
             ok, msg = test_github_connection()

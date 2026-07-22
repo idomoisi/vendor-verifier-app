@@ -3,3 +3,5 @@ databricks-sdk
 databricks-sql-connector
 google-genai
 pandas
+requests
+PyJWT[cryptography]

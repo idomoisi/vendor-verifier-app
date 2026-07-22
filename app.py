@@ -22,15 +22,19 @@ from db import (
     is_manuf_vendor,
     load_vendor_enum_keys,
     load_vendor_registry,
-    load_verified_names,
     set_jira_ticket,
     update_raw_vendor_status,
     upsert_raw_vendor,
     upsert_vendor_verify,
 )
-from duplicate_check import SimilarVendor, find_similar, is_duplicate
-from github_pr import create_vendor_pr, test_github_connection
-from jira import create_vendor_ticket
+from duplicate_check import (
+    SimilarVendor,
+    detect_existing_vendor_for_normalized_name,
+    find_similar,
+    is_duplicate,
+)
+from github_pr import create_vendor_pr, find_open_vendor_pr, test_github_connection
+from jira import create_vendor_ticket, link_pr_to_jira
 from normalization import (
     check_enum_collision,
     clean_official_name,
@@ -78,21 +82,22 @@ def get_gemini_api_key() -> str:
 
 
 def get_current_user() -> str:
+    """Return the viewing user's email from Databricks Apps forwarded headers.
+
+    Do not use Config().authenticate() here — that returns the app service
+  principal (deployer), so every visitor would inherit developer access.
+    """
     try:
-        from databricks.sdk.core import Config
-
-        cfg = Config()
-        headers = cfg.authenticate()
-        import requests
-
-        resp = requests.get(f"{cfg.host.rstrip('/')}/api/2.0/preview/scim/v2/Me", headers=headers, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            # Prefer primary email from emails list, fall back to userName
-            for email_obj in data.get("emails", []):
-                if email_obj.get("primary"):
-                    return email_obj["value"]
-            return data.get("userName", "unknown")
+        headers = st.context.headers
+        for key in (
+            "X-Forwarded-Email",
+            "x-forwarded-email",
+            "X-Forwarded-Preferred-Username",
+            "x-forwarded-preferred-username",
+        ):
+            value = headers.get(key)
+            if value and "@" in value:
+                return value.strip().lower()
     except Exception:
         pass
     return "unknown"
@@ -105,11 +110,11 @@ _DEVELOPER_EMAILS = {
 
 
 def is_developer(email: str) -> bool:
-    return email.lower() in _DEVELOPER_EMAILS
+    return email.strip().lower() in _DEVELOPER_EMAILS
 
 
 def is_support_mode() -> bool:
-    """Developer-only preview of the Support UI (sidebar toggle)."""
+    """True when a developer is previewing the simplified Support UI."""
     return bool(st.session_state.get("support_mode", False))
 
 
@@ -117,8 +122,27 @@ def effective_dev_mode(email: str) -> bool:
     return is_developer(email) and not is_support_mode()
 
 
+def enum_key_for_display(display: str, enum_keys: list[tuple[str, str]]) -> str | None:
+    target = display.strip().lower()
+    for key, value in enum_keys:
+        if value.strip().lower() == target:
+            return key
+    return None
+
+
+def detect_normalized_parent_alias(
+    vendor_name: str,
+    official: str,
+    registry: list[str],
+) -> tuple[bool, str | None]:
+    """True when AI normalized to a name that already exists — raw input should be an alias."""
+    is_alias, match_name, _ = detect_existing_vendor_for_normalized_name(vendor_name, official, registry)
+    return is_alias, match_name
+
+
 @st.cache_resource(ttl=300)
 def cached_registry() -> list[str]:
+    """Vendor display names from device.py only (not pending app verifications)."""
     return load_vendor_registry()
 
 
@@ -148,78 +172,6 @@ def render_similar_vendors(similar: list[SimilarVendor]) -> None:
         st.markdown(f"{icon} **{s.name}** -- {s.score:.0%} ({s.match_type})")
 
 
-def resolve_alias_target(
-    similar: list[tuple[str, float, str]],
-    enum_keys: list[tuple[str, str]],
-) -> tuple[str | None, str | None]:
-    """Map the best similar vendor name to (enum_key, display_value)."""
-    if not similar or not enum_keys:
-        return None, None
-    best = similar[0][0]
-    for enum_key, display in enum_keys:
-        if (
-            best.lower() == display.lower()
-            or best.lower() in display.lower()
-            or display.lower() in best.lower()
-        ):
-            return enum_key, display
-    for enum_key, display in enum_keys:
-        label = f"{enum_key} ({display})"
-        if best.lower() in label.lower():
-            return enum_key, display
-    return None, best
-
-
-def merge_similar_matches(
-    *match_lists: list[tuple[str, float, str]],
-) -> list[tuple[str, float, str]]:
-    """Merge match lists, keeping the highest score per vendor name."""
-    best: dict[str, tuple[str, float, str]] = {}
-    for matches in match_lists:
-        for name, score, match_type in matches:
-            prev = best.get(name)
-            if prev is None or score > prev[1]:
-                best[name] = (name, score, match_type)
-    merged = list(best.values())
-    merged.sort(key=lambda x: x[1], reverse=True)
-    return merged
-
-
-def should_block_support_submission(
-    effective_similar: list[tuple[str, float, str]],
-    pr_case: str,
-    *,
-    dev_mode: bool,
-) -> bool:
-    """Support cannot submit alias PRs or vendors that match an existing entry."""
-    if dev_mode:
-        return False
-    if pr_case == "alias":
-        return True
-    if not effective_similar:
-        return False
-    best_name, best_score, best_type = effective_similar[0]
-    return best_type == "exact" or best_score >= 0.90
-
-
-def render_support_already_exists(
-    vendor_name: str,
-    effective_similar: list[tuple[str, float, str]],
-    official: str,
-) -> None:
-    alias_target_enum, canonical_display = resolve_alias_target(
-        effective_similar,
-        cached_enum_keys(),
-    )
-    match_display = canonical_display or (effective_similar[0][0] if effective_similar else official)
-    enum_label = f"`Vendor.{alias_target_enum}`" if alias_target_enum else "an existing vendor"
-    st.success(
-        f"✅ **Already in the system** — **{vendor_name}** matches existing vendor "
-        f"**{match_display}** ({enum_label}).\n\n"
-        f"No action needed."
-    )
-
-
 def render_report(result: dict, search_grounded: bool) -> None:
     oui = result.get("mac_oui_check", "Unknown")
     oui_icon = "✅" if oui.lower().startswith("yes") else "❌" if oui.lower().startswith("no") else "❓"
@@ -247,9 +199,32 @@ def render_report(result: dict, search_grounded: bool) -> None:
                 st.markdown(f"- [{a}]({a})")
 
 
+def _build_sv_from_prev(
+    prev: dict,
+    *,
+    official: str,
+    enum: str,
+    registry: list[str],
+    similar: list,
+) -> dict:
+    """Build session-state payload from an existing vendor_verify row."""
+    return {
+        "dup": False,
+        "result": prev,
+        "raw": prev.get("raw_output", "{}"),
+        "grounded": bool(prev.get("search_grounded")),
+        "verdict": prev.get("verdict", "LEGIT"),
+        "grounded_label": "🌐 Web-verified" if prev.get("search_grounded") else "⚠️ Not grounded",
+        "similar": [(s.name, s.score, s.match_type) for s in similar],
+        "official": official,
+        "enum": enum,
+        "registry": registry,
+    }
+
+
 def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
     """Render the result panel, using session state so button clicks don't wipe results."""
-    sv = st.session_state.get("sv", {})
+    skip_ai = False
 
     _DEMO_RESULT = {
         "verdict": "LEGIT",
@@ -283,7 +258,7 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
 
     # ── Run pipeline when Verify was just clicked ──
     if st.session_state.pop("_run_pipeline", False):
-        registry = cached_registry()
+        codebase_registry = cached_registry()
         api_key = get_gemini_api_key()
         user = get_current_user()
 
@@ -311,160 +286,169 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
                 "similar": [],
                 "official": demo_official,
                 "enum": demo_enum,
-                "registry": registry,
+                "registry": codebase_registry,
             }
             st.rerun()
 
-        # Step 1: Duplicate Check
-        verified_names = load_verified_names()
+        # Step 1: Duplicate Check (codebase only)
         with st.status("Checking for duplicates...", expanded=True) as dup_status:
-            similar = find_similar(vendor_name, registry)
+            similar = find_similar(vendor_name, codebase_registry)
             dup = is_duplicate(similar)
+            prev = get_verified_vendor(vendor_name)
 
             if dup:
                 match = similar[0]
                 label = "Exact match" if match.match_type == "exact" else f"High similarity ({match.score:.0%})"
-
-                # Check if the match is from a previous app verification (not from codebase)
-                if match.name in verified_names:
-                    dup_status.update(label="Previously verified — resume?", state="running")
-                    prev = get_verified_vendor(match.name) or get_verified_vendor(vendor_name)
-                    if prev:
-                        verdict_icon = {"LEGIT": "✅", "SOFTWARE-ONLY": "❌", "SUSPICIOUS": "⚠️"}.get(prev.get("verdict", ""), "❓")
-                        st.warning(
-                            f"**{label}:** `{match.name}` was already verified by this app "
-                            f"but no ticket was created yet.\n\n"
-                            f"Verdict: {verdict_icon} **{prev.get('verdict')}** — "
-                            f"Confidence: {prev.get('confidence_score', 'N/A')}"
-                        )
-                        if st.button("▶️ Resume — go to ticket creation", type="primary"):
-                            official = clean_official_name(prev.get("normalized_name") or match.name)
-                            enum = generate_enum_name(official)
-                            if check_enum_collision(enum, registry):
-                                enum = f"{enum}Corp"
-                            st.session_state["sv"] = {
-                                "dup": False,
-                                "result": prev,
-                                "raw": prev.get("raw_output", "{}"),
-                                "grounded": bool(prev.get("search_grounded")),
-                                "verdict": prev.get("verdict", "LEGIT"),
-                                "grounded_label": "🌐 Web-verified" if prev.get("search_grounded") else "⚠️ Not grounded",
-                                "similar": [],
-                                "official": official,
-                                "enum": enum,
-                                "registry": registry,
-                            }
-                            st.rerun()
-                    else:
-                        dup_status.update(label="Duplicate found", state="error")
-                        st.error(f"**{label}:** `{match.name}`\n\nCheck the History tab for the previous verification.")
-                else:
-                    dup_status.update(label="Duplicate found", state="error")
-                    st.error(f"**{label}:** `{match.name}`\n\nThis vendor already exists in the codebase. No verification needed.")
-
+                dup_status.update(label="Duplicate found", state="error")
+                st.error(
+                    f"**{label}:** `{match.name}`\n\n"
+                    f"This vendor already exists in the codebase. No verification needed."
+                )
                 if len(similar) > 1:
                     st.caption("Other similar vendors:")
                     render_similar_vendors(similar[1:])
                 upsert_raw_vendor(vendor_name, vendor_url or None, user, is_existed=True, status="DUPLICATE")
-                st.session_state["sv"] = {"dup": True}
-                return
+                st.session_state["sv"] = {
+                    "dup": True,
+                    "dup_message": f"**{label}:** `{match.name}` is already in the system.",
+                }
+                skip_ai = True
 
-            if similar:
-                dup_status.update(label="Similar found (< 90%)", state="running")
-                st.warning("**Similar vendors found** (below 90% -- proceeding):")
-                render_similar_vendors(similar)
-            else:
-                dup_status.update(label="No duplicates", state="complete", expanded=False)
+            elif prev and prev.get("verdict") == "LEGIT":
+                # Same input verified earlier in this app — resume without re-running AI.
+                official = clean_official_name(prev.get("normalized_name") or vendor_name)
+                enum = generate_enum_name(official)
+                if check_enum_collision(enum, codebase_registry):
+                    enum = f"{enum}Corp"
+                dup_status.update(
+                    label="Previously verified — resuming to ticket creation",
+                    state="complete",
+                    expanded=False,
+                )
+                st.info(
+                    f"**`{vendor_name}`** was already verified in this app — "
+                    f"skipping AI and opening ticket creation."
+                )
+                if similar:
+                    st.caption("Similar vendors in codebase:")
+                    render_similar_vendors(similar)
+                upsert_raw_vendor(
+                    vendor_name, vendor_url or None, user, is_existed=bool(similar), status="COMPLETED"
+                )
+                st.session_state["sv"] = _build_sv_from_prev(
+                    prev, official=official, enum=enum, registry=codebase_registry, similar=similar
+                )
+                skip_ai = True
 
-        # Step 2: AI Verification
-        with st.status("Verifying with Gemini Pro + Google Search...", expanded=True) as ai_status:
-            if not api_key:
-                ai_status.update(label="No API key", state="error")
-                st.error("Gemini API key not configured.")
-                return
-
-            upsert_raw_vendor(vendor_name, vendor_url or None, user, is_existed=bool(similar), status="PROCESSING")
-            result, raw, grounded = verify_vendor(vendor_name, vendor_url or None, api_key)
-
-            if result is None:
-                ai_status.update(label="Verification failed", state="error")
-                st.error("All verification attempts failed. Try again later.")
-                increment_failure(vendor_name)
-                return
-
-            verdict = result.get("verdict", "SUSPICIOUS")
-            grounded_label = "🌐 Web-verified" if grounded else "⚠️ Not grounded"
-
-            if verdict == "LEGIT":
-                ai_status.update(label=f"LEGIT ({grounded_label})", state="complete")
-                st.success(f"**Verdict: LEGIT** -- Confirmed hardware manufacturer ({grounded_label})")
-            elif verdict == "SOFTWARE-ONLY":
-                ai_status.update(label=f"SOFTWARE-ONLY ({grounded_label})", state="error")
-                st.error(f"**Verdict: SOFTWARE-ONLY** ({grounded_label})")
-            else:
-                ai_status.update(label=f"SUSPICIOUS ({grounded_label})", state="running")
-                st.warning(f"**Verdict: SUSPICIOUS** -- Manual review needed ({grounded_label})")
-
-        official = clean_official_name(result.get("official_name", vendor_name))
-
-        # If official name has no usable Latin characters (e.g. Chinese/Arabic script),
-        # fall back to the user's original input and flag it for manual correction.
-        import re as _re
-        _latin_chars = _re.sub(r"[^a-zA-Z0-9]", "", official)
-        _non_latin_name = len(_latin_chars) < 3
-        if _non_latin_name:
-            official = vendor_name  # fall back to what the user typed
-
-        enum = generate_enum_name(official)
-        if not enum:
-            enum = "UnknownVendor"
-        if check_enum_collision(enum, registry):
-            enum = f"{enum}Corp"
-
-        # Step 3: Gate 2 — re-check duplicate on AI-normalized name
-        # (catches suffixes/aliases stripped by AI, e.g. "Rockwell Automation Inc" → "Rockwell Automation")
-        similar_norm_tuples: list[tuple[str, float, str]] = []
-        if official.lower() != vendor_name.lower():
-            with st.status(f"Re-checking normalized name: {official}...", expanded=True) as norm_status:
-                similar_norm = find_similar(official, registry)
-                similar_norm_tuples = [(s.name, s.score, s.match_type) for s in similar_norm]
-                dup_norm = is_duplicate(similar_norm)
-
-                if dup_norm:
-                    match = similar_norm[0]
-                    label = "Exact match" if match.match_type == "exact" else f"High similarity ({match.score:.0%})"
-                    norm_status.update(label=f"Normalized name may already exist ({label})", state="running")
-                    st.warning(
-                        f"**AI normalized** `{vendor_name}` → **`{official}`**, "
-                        f"which looks similar to `{match.name}` ({label}).\n\n"
-                        f"Please verify this is not a duplicate before proceeding."
-                    )
-                elif similar_norm:
-                    norm_status.update(label="Similar normalized name (< 90%) -- proceeding", state="running")
-                    st.warning(f"**Normalized name `{official}` has similar vendors** (below 90%):")
-                    render_similar_vendors(similar_norm)
+            if not skip_ai:
+                if similar:
+                    dup_status.update(label="Similar found (< 90%)", state="running")
+                    st.warning("**Similar vendors found** (below 90% -- proceeding):")
+                    render_similar_vendors(similar)
                 else:
-                    norm_status.update(label="Normalized name is unique", state="complete", expanded=False)
+                    dup_status.update(label="No duplicates", state="complete", expanded=False)
 
-        upsert_vendor_verify(vendor_name, result, grounded, raw)
-        update_raw_vendor_status(vendor_name, "COMPLETED")
+        if not skip_ai:
+            # Step 2: AI Verification
+            with st.status("Verifying with Gemini Pro + Google Search...", expanded=True) as ai_status:
+                if not api_key:
+                    ai_status.update(label="No API key", state="error")
+                    st.error("Gemini API key not configured.")
+                    return
 
-        # Persist everything needed for subsequent reruns
-        st.session_state["sv"] = {
-            "dup": False,
-            "result": result,
-            "raw": raw,
-            "grounded": grounded,
-            "verdict": verdict,
-            "non_latin_name": _non_latin_name,
-            "grounded_label": grounded_label,
-            "similar": [(s.name, s.score, s.match_type) for s in similar],
-            "similar_norm": similar_norm_tuples,
-            "official": official,
-            "enum": enum,
-            "registry": registry,
-        }
-        sv = st.session_state["sv"]
+                upsert_raw_vendor(vendor_name, vendor_url or None, user, is_existed=bool(similar), status="PROCESSING")
+                result, raw, grounded = verify_vendor(vendor_name, vendor_url or None, api_key)
+
+                if result is None:
+                    ai_status.update(label="Verification failed", state="error")
+                    st.error("All verification attempts failed. Try again later.")
+                    increment_failure(vendor_name)
+                    return
+
+                verdict = result.get("verdict", "SUSPICIOUS")
+                grounded_label = "🌐 Web-verified" if grounded else "⚠️ Not grounded"
+
+                if verdict == "LEGIT":
+                    ai_status.update(label=f"LEGIT ({grounded_label})", state="complete")
+                    st.success(f"**Verdict: LEGIT** -- Confirmed hardware manufacturer ({grounded_label})")
+                elif verdict == "SOFTWARE-ONLY":
+                    ai_status.update(label=f"SOFTWARE-ONLY ({grounded_label})", state="error")
+                    st.error(f"**Verdict: SOFTWARE-ONLY** ({grounded_label})")
+                else:
+                    ai_status.update(label=f"SUSPICIOUS ({grounded_label})", state="running")
+                    st.warning(f"**Verdict: SUSPICIOUS** -- Manual review needed ({grounded_label})")
+
+            official = clean_official_name(result.get("official_name", vendor_name))
+
+            # If official name has no usable Latin characters (e.g. Chinese/Arabic script),
+            # fall back to the user's original input and flag it for manual correction.
+            _latin_chars = re.sub(r"[^a-zA-Z0-9]", "", official)
+            _non_latin_name = len(_latin_chars) < 3
+            if _non_latin_name:
+                official = vendor_name  # fall back to what the user typed
+
+            enum = generate_enum_name(official)
+            if not enum:
+                enum = "UnknownVendor"
+            if check_enum_collision(enum, codebase_registry):
+                enum = f"{enum}Corp"
+
+            # Step 3: Gate 2 — re-check duplicate on AI-normalized name (codebase only)
+            gate2_duplicate = False
+            gate2_match_name: str | None = None
+            gate2_match_type = ""
+            similar_norm: list[SimilarVendor] = []
+            if official.lower() != vendor_name.lower():
+                with st.status(f"Re-checking normalized name: {official}...", expanded=True) as norm_status:
+                    gate2_duplicate, gate2_match_name, gate2_match_type = (
+                        detect_existing_vendor_for_normalized_name(vendor_name, official, codebase_registry)
+                    )
+
+                    if gate2_duplicate and gate2_match_name:
+                        label = {
+                            "exact": "Exact match",
+                            "parent-brand": "Parent brand",
+                            "parent-prefix": "Parent brand",
+                        }.get(gate2_match_type, "High similarity")
+                        norm_status.update(label=f"Existing vendor identified ({label})", state="complete")
+                        st.info(
+                            f"**AI normalized** `{vendor_name}` → **`{official}`**, which maps to "
+                            f"existing vendor **`{gate2_match_name}`** ({label}).\n\n"
+                            f"**`{vendor_name}`** will be added as an alias for **`{gate2_match_name}`**."
+                        )
+                    else:
+                        similar_norm = find_similar(official, codebase_registry)
+                        if similar_norm:
+                            norm_status.update(
+                                label="Similar normalized name (< 90%) -- proceeding",
+                                state="running",
+                            )
+                            st.warning(f"**Normalized name `{official}` has similar vendors** (below 90%):")
+                            render_similar_vendors(similar_norm)
+                        else:
+                            norm_status.update(label="Normalized name is unique", state="complete", expanded=False)
+
+            upsert_vendor_verify(vendor_name, result, grounded, raw)
+            update_raw_vendor_status(vendor_name, "COMPLETED")
+
+            st.session_state["sv"] = {
+                "dup": False,
+                "result": result,
+                "raw": raw,
+                "grounded": grounded,
+                "verdict": verdict,
+                "non_latin_name": _non_latin_name,
+                "grounded_label": grounded_label,
+                "similar": [(s.name, s.score, s.match_type) for s in similar],
+                "similar_norm": [(s.name, s.score, s.match_type) for s in similar_norm],
+                "gate2_duplicate": gate2_duplicate,
+                "gate2_match_name": gate2_match_name,
+                "official": official,
+                "enum": enum,
+                "registry": codebase_registry,
+            }
+
+    sv = st.session_state.get("sv", {})
 
     # ── Nothing stored yet ──
     if not sv:
@@ -472,7 +456,8 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
         return
 
     if sv.get("dup"):
-        return  # duplicate message was already shown during pipeline run
+        st.error(sv.get("dup_message", "This vendor already exists in the system. No verification needed."))
+        return
 
     # ── Re-render results from session state ──
     result = sv["result"]
@@ -513,49 +498,67 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
     if verdict == "LEGIT":
         st.divider()
 
-        registry = sv.get("registry") or cached_registry()
-        effective_similar = merge_similar_matches(
-            sv.get("similar", []),
-            sv.get("similar_norm", []),
-            [(s.name, s.score, s.match_type) for s in find_similar(official, registry)],
-        )
-
         # ── Auto-detect PR case (always) ──
+        registry = sv.get("registry") or cached_registry()
+        gate2_duplicate, gate2_match_name = detect_normalized_parent_alias(
+            vendor_name, official, registry
+        )
+        if not gate2_duplicate and sv.get("gate2_duplicate"):
+            gate2_duplicate = True
+            gate2_match_name = sv.get("gate2_match_name")
+
         final_enum = enum
         final_display = official
+        alias_string = vendor_name
         alias_target_enum: str | None = None
         manuf_enum: str | None = None
+        enum_keys = cached_enum_keys()
 
-        manuf_matches = find_manuf_matches(final_display, preloaded_pairs=cached_manuf_pairs())
+        manuf_matches: list[tuple[str, str, float]] = []
         manuf_original_display: str | None = None
 
-        if manuf_matches:
-            # Show fuzzy manuf matches and let user decide
-            options_display = [f"{disp} ({score:.0%} match)" for _, disp, score in manuf_matches]
-            options_display.append("None of these — add as new vendor")
-            selected_manuf = st.radio(
-                "⬆️ Similar entries found in the manuf-file section. Is this a promotion?",
-                options=options_display,
-                index=len(options_display) - 1,  # default to "None"
-                key="manuf_match_select",
-            )
-            if selected_manuf == options_display[-1]:
-                pr_case = "new"
-                manuf_enum = None
-            else:
-                pr_case = "promote"
-                idx = options_display.index(selected_manuf)
-                manuf_enum = manuf_matches[idx][0]
-                manuf_original_display = manuf_matches[idx][1]
-        elif effective_similar and any(s[1] >= 0.85 for s in effective_similar):
+        if gate2_duplicate and gate2_match_name:
             pr_case = "alias"
+            alias_target_enum = enum_key_for_display(gate2_match_name, enum_keys)
+            if not alias_target_enum:
+                gate2_duplicate = False
+                gate2_match_name = None
+                pr_case = "new"
+        elif not gate2_duplicate:
+            manuf_matches = find_manuf_matches(final_display, preloaded_pairs=cached_manuf_pairs())
+            if manuf_matches:
+                # Show fuzzy manuf matches and let user decide
+                options_display = [f"{disp} ({score:.0%} match)" for _, disp, score in manuf_matches]
+                options_display.append("None of these — add as new vendor")
+                selected_manuf = st.radio(
+                    "⬆️ Similar entries found in the manuf-file section. Is this a promotion?",
+                    options=options_display,
+                    index=len(options_display) - 1,  # default to "None"
+                    key="manuf_match_select",
+                )
+                if selected_manuf == options_display[-1]:
+                    pr_case = "new"
+                    manuf_enum = None
+                else:
+                    pr_case = "promote"
+                    idx = options_display.index(selected_manuf)
+                    manuf_enum = manuf_matches[idx][0]
+                    manuf_original_display = manuf_matches[idx][1]
+            elif sv.get("similar") and any(s[1] >= 0.85 for s in sv.get("similar", [])):
+                pr_case = "alias"
+                best = sv["similar"][0][0]
+                alias_target_enum = enum_key_for_display(best, enum_keys)
+                if not alias_target_enum:
+                    pr_case = "new"
+            else:
+                pr_case = "new"
         else:
-            pr_case = "new"
+            pr_case = "alias"
 
-        # In demo mode, allow developer to override the detected case
-        if dev_mode and vendor_name.strip().lower() == "__demo__":
+        # Allow developer to override the auto-detected case
+        if dev_mode:
             pr_case = st.selectbox(
-                "Demo: simulate case",
+                "Override detected case",
                 options=["new", "alias", "promote"],
                 index=["new", "alias", "promote"].index(pr_case),
                 format_func=lambda x: {"new": "🆕 New vendor", "alias": "🔗 Alias", "promote": "⬆️ Promote from manuf"}[x],
@@ -564,7 +567,15 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
 
         case_labels = {
             "new": ("🆕", "New vendor", f"**{official}** will be added as a new vendor to the system."),
-            "alias": ("🔗", "Alias detected", f"**{official}** is another name for an existing vendor."),
+            "alias": (
+                "🔗",
+                "Alias detected",
+                (
+                    f"**`{alias_string}`** will be added as an alias for **`{gate2_match_name}`**."
+                    if gate2_duplicate and gate2_match_name
+                    else f"**{alias_string}** is another name for an existing vendor."
+                ),
+            ),
             "promote": ("⬆️", "Existing manuf-file vendor", f"**{official}** exists as a low-priority entry and will be promoted to a first-class vendor."),
         }
         icon, case_title, case_desc = case_labels[pr_case]
@@ -574,31 +585,43 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
             st.subheader("Name Normalization")
             if official.lower() != vendor_name.lower():
                 st.info(f"**AI corrected:** `{vendor_name}` → **{official}**")
+            if pr_case == "alias":
+                st.caption(f"Alias string to add: **`{alias_string}`**")
 
             col_e, col_d = st.columns(2)
             with col_e:
-                final_enum = st.text_input("Enum Name", value=enum, key="input_enum")
+                final_enum = st.text_input(
+                    "Enum Name",
+                    value=enum,
+                    key="input_enum",
+                    disabled=pr_case == "alias",
+                )
             with col_d:
-                final_display = st.text_input("Display Value", value=official, key="input_display")
+                final_display = st.text_input(
+                    "Display Value",
+                    value=official,
+                    key="input_display",
+                    disabled=pr_case == "alias",
+                )
 
             st.divider()
             st.subheader("Code Changes")
             st.info(f"**{icon} Detected: {case_title}** — {case_desc}")
 
             if pr_case == "alias":
-                enum_keys = cached_enum_keys()
                 options = [f"{k} ({v})" for k, v in enum_keys]
                 default_idx = 0
-                if effective_similar:
-                    best_match_name = effective_similar[0][0]
-                    for i, opt in enumerate(options):
-                        if best_match_name.lower() in opt.lower():
-                            default_idx = i
-                            break
+                target_name = gate2_match_name or ""
+                if not target_name and sv.get("similar"):
+                    target_name = sv["similar"][0][0]
+                for i, opt in enumerate(options):
+                    if target_name and target_name.lower() in opt.lower():
+                        default_idx = i
+                        break
                 selected = st.selectbox("Alias target vendor:", options=options, index=default_idx, key="alias_target")
                 alias_target_enum = selected.split(" (")[0] if selected else None
                 has_existing = check_vendor_has_alias_entry(alias_target_enum) if alias_target_enum else False
-                snippets = generate_alias_snippet(alias_target_enum or "", final_display, has_existing_entry=has_existing)
+                snippets = generate_alias_snippet(alias_target_enum or "", alias_string, has_existing_entry=has_existing)
             elif pr_case == "promote":
                 snippets = generate_promote_snippet(
                     manuf_enum or final_enum,
@@ -626,25 +649,47 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
 
         else:
             # ── Support mode: clear summary only ──
-            if should_block_support_submission(effective_similar, pr_case, dev_mode=dev_mode):
-                render_support_already_exists(vendor_name, effective_similar, official)
+            if pr_case == "alias":
+                target_name = gate2_match_name or (sv["similar"][0][0] if sv.get("similar") else official)
+                if not alias_target_enum:
+                    options_raw = [f"{k} ({v})" for k, v in enum_keys]
+                    default_idx = 0
+                    for i, opt in enumerate(options_raw):
+                        if target_name and target_name.lower() in opt.lower():
+                            default_idx = i
+                            break
+                    alias_target_enum = options_raw[default_idx].split(" (")[0] if options_raw else None
+                enum_label = f"`Vendor.{alias_target_enum}`" if alias_target_enum else "an existing vendor"
+                match_display = target_name or official
+                st.success(
+                    f"✅ **Already in the system** — **{vendor_name}** matches existing vendor "
+                    f"**{match_display}** ({enum_label}).\n\n"
+                    f"No action needed."
+                )
             else:
                 st.info(f"{icon} **{case_title}:** {case_desc}")
 
-        support_alias_blocked = should_block_support_submission(effective_similar, pr_case, dev_mode=dev_mode)
-
-        # ── Jira Ticket + GitHub PR ──
-        if support_alias_blocked:
+        # Support cannot create alias PRs — hard stop before submit/Jira/PR.
+        if not dev_mode and pr_case == "alias":
             return
 
+        # ── Jira Ticket + GitHub PR ──
         st.divider()
 
         def _do_submit(submit_enum: str, submit_display: str, submit_case: str,
                        submit_alias: str | None, submit_manuf: str | None,
                        submit_manuf_original_display: str | None = None) -> None:
+            submit_display_for_pr = alias_string if submit_case == "alias" else submit_display
             with st.spinner("Creating Jira ticket and GitHub PR..."):
                 try:
-                    ticket_key, _ = create_vendor_ticket(vendor_name, submit_enum, submit_display, result)
+                    ticket_key, _ = create_vendor_ticket(
+                        vendor_name,
+                        submit_enum,
+                        submit_display_for_pr,
+                        result,
+                        case=submit_case,
+                        alias_target_display=submit_display if submit_case == "alias" else None,
+                    )
                     set_jira_ticket(vendor_name, ticket_key)
                     st.session_state[f"jira_{vendor_name}"] = ticket_key
                 except RuntimeError as e:
@@ -652,13 +697,15 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
                     return
                 try:
                     pr_link, _ = create_vendor_pr(
-                        submit_enum, submit_display, ticket_key, result,
+                        submit_enum, submit_display_for_pr, ticket_key, result,
                         case=submit_case,
                         alias_target_enum=submit_alias,
                         manuf_enum_name=submit_manuf,
                         manuf_original_display=submit_manuf_original_display,
+                        input_vendor=vendor_name,
                     )
                     st.session_state[f"pr_{vendor_name}"] = pr_link
+                    link_pr_to_jira(ticket_key, pr_link)
                 except RuntimeError as e:
                     st.session_state[f"pr_error_{vendor_name}"] = str(e)
                 st.session_state.pop(f"confirm_{vendor_name}", None)
@@ -667,7 +714,26 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
         jira_key = st.session_state.get(f"jira_{vendor_name}")
         pr_url = st.session_state.get(f"pr_{vendor_name}")
 
-        if jira_key:
+        open_pr = None
+        if not pr_url:
+            pr_lookup_display = alias_string if pr_case == "alias" else final_display
+            open_pr_cache_key = f"open_pr_{vendor_name}_{final_enum}_{pr_case}"
+            if open_pr_cache_key not in st.session_state:
+                st.session_state[open_pr_cache_key] = find_open_vendor_pr(
+                    enum_name=final_enum,
+                    display_name=pr_lookup_display,
+                    input_vendor=vendor_name,
+                    case=pr_case,
+                    alias_target_enum=alias_target_enum,
+                )
+            open_pr = st.session_state[open_pr_cache_key]
+
+        if open_pr and not pr_url:
+            st.warning(
+                f"An open PR already exists for this vendor — nothing new will be created.\n\n"
+                f"**[#{open_pr.number} {open_pr.title}]({open_pr.url})**"
+            )
+        elif jira_key:
             jira_url = f"https://team82.atlassian.net/browse/{jira_key}"
             st.success(f"Ticket created: **[{jira_key}]({jira_url})**")
             if pr_url:
@@ -682,9 +748,14 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
             st.caption("Opens a NET task and a GitHub PR on `staging` with the exact code changes.")
             if not st.session_state.get(f"confirm_{vendor_name}"):
                 case_label = {"new": "new vendor", "alias": "alias", "promote": "vendor promotion"}.get(pr_case, pr_case)
+                ticket_subject = (
+                    f"`{alias_string}` → `{gate2_match_name}`"
+                    if pr_case == "alias" and gate2_match_name
+                    else final_display
+                )
                 st.info(
                     f"This will immediately:\n"
-                    f"- Open a **NET Jira ticket** titled `[Vendor Verifier] Add {case_label}: {final_display}`\n"
+                    f"- Open a **NET Jira ticket** titled `[Vendor Verifier] Add {case_label}: {ticket_subject}`\n"
                     f"- Create a **GitHub PR** on a branch off `staging` with the exact code changes shown above\n\n"
                     f"Make sure everything above looks correct before proceeding."
                 )
@@ -769,13 +840,14 @@ def main() -> None:
             vendor_url = st.text_input("Website (optional)", placeholder="e.g., https://newhavendisplay.com")
             run = st.button("Verify", type="primary", use_container_width=True)
 
-        # Clear stored results when vendor name changes
-        if st.session_state.get("sv_vendor") != vendor_name:
-            st.session_state.pop("sv", None)
-            st.session_state["sv_vendor"] = vendor_name
-
         if run and vendor_name:
             st.session_state["_run_pipeline"] = True
+
+        # Clear stored results only when the vendor name actually changed (not mid-verify).
+        if st.session_state.get("sv_vendor") != vendor_name:
+            if not st.session_state.get("_run_pipeline"):
+                st.session_state.pop("sv", None)
+            st.session_state["sv_vendor"] = vendor_name
 
         with col_result:
             if vendor_name:

@@ -13,6 +13,8 @@ import base64
 import logging
 import os
 import re
+import time
+from dataclasses import dataclass
 
 import requests
 
@@ -24,30 +26,211 @@ BASE_BRANCH = "staging"
 
 DEVICE_PY_PATH = "medigator/common/domain_model/xiot/device.py"
 TYPES_PY_PATH = "medigator/common/domain_model/intels/vulnerabilities/types.py"
+VENDOR_VERIFIER_BRANCH_MARKER = "vendor-verifier/adding_"
 
 
-def _get_github_token() -> str:
-    token = os.environ.get("GITHUB_TOKEN", "")
-    if token:
-        return token
+@dataclass(frozen=True)
+class OpenVendorPr:
+    url: str
+    title: str
+    number: int
+    branch: str
+
+
+@dataclass(frozen=True)
+class GitHubAuth:
+    token: str
+    mode: str  # "github-app" | "env-pat" | "secret-pat" | "none"
+    reason: str = ""
+
+
+def _get_databricks_secret(scope: str, key: str) -> str:
     try:
-        import requests as req
         from databricks.sdk.core import Config
 
         cfg = Config()
         host = cfg.host.rstrip("/")
         headers = cfg.authenticate()
-        resp = req.get(
+        resp = requests.get(
             f"{host}/api/2.0/secrets/get",
             headers=headers,
-            params={"scope": "vendor-validation-app", "key": "github_token"},
+            params={"scope": scope, "key": key},
             timeout=10,
         )
         if resp.status_code == 200:
             return base64.b64decode(resp.json()["value"]).decode()
     except Exception:
-        pass
+        logger.exception("Failed reading Databricks secret %s/%s", scope, key)
     return ""
+
+
+def _get_github_app_token() -> tuple[str, str]:
+    """Return (installation token, failure reason)."""
+    app_id = _get_databricks_secret("vendor-validation-app", "github_app_id").strip()
+    private_key = _get_databricks_secret("vendor-validation-app", "github_app_private_key")
+    installation_id = _get_databricks_secret(
+        "vendor-validation-app", "github_app_installation_id"
+    ).strip()
+
+    if not app_id or not private_key or not installation_id:
+        return "", "missing github_app_id/private_key/installation_id"
+
+    try:
+        import jwt as pyjwt
+
+        now = int(time.time())
+        app_jwt = pyjwt.encode(
+            {
+                "iat": now - 60,
+                "exp": now + 600,
+                "iss": str(app_id),
+            },
+            private_key,
+            algorithm="RS256",
+        )
+
+        token_resp = requests.post(
+            f"{GITHUB_API}/app/installations/{installation_id}/access_tokens",
+            headers={
+                "Authorization": f"Bearer {app_jwt}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=15,
+        )
+        if token_resp.status_code != 201:
+            logger.warning(
+                "GitHub App token exchange failed: HTTP %s %s",
+                token_resp.status_code,
+                token_resp.text[:300],
+            )
+            return "", f"token exchange HTTP {token_resp.status_code}"
+        token = token_resp.json().get("token", "")
+        if not token:
+            return "", "token exchange returned empty token"
+        return token, ""
+    except Exception:
+        logger.exception("GitHub App auth failed")
+        return "", "exception during GitHub App auth"
+
+
+def _is_vendor_verifier_pr(pr: dict) -> bool:
+    head = pr.get("head", {}).get("ref", "").lower()
+    title = pr.get("title", "").lower()
+    return VENDOR_VERIFIER_BRANCH_MARKER in head or "[vendor verifier]" in title
+
+
+def _pr_matches_vendor(
+    pr: dict,
+    *,
+    enum_name: str,
+    display_name: str,
+    input_vendor: str | None,
+    case: str,
+    alias_target_enum: str | None,
+) -> bool:
+    head = pr.get("head", {}).get("ref", "").lower()
+    title = pr.get("title", "").lower()
+    body = (pr.get("body") or "").lower()
+    text_blob = f"{title} {body}"
+
+    enum_key = enum_name.strip().lower()
+    if enum_key and f"{VENDOR_VERIFIER_BRANCH_MARKER}{enum_key}" in head:
+        return True
+
+    for needle in (input_vendor, display_name):
+        if needle and needle.strip().lower() in text_blob:
+            if case == "alias" and "alias" in text_blob:
+                return True
+            if case == "promote" and "promote" in text_blob:
+                return True
+            if case == "new" and "add new vendor" in text_blob:
+                return True
+
+    if case == "alias" and alias_target_enum:
+        target = alias_target_enum.strip().lower()
+        if target and target in text_blob and "alias" in text_blob:
+            return True
+
+    return False
+
+
+def find_open_vendor_pr(
+    *,
+    enum_name: str,
+    display_name: str,
+    input_vendor: str | None = None,
+    case: str = "new",
+    alias_target_enum: str | None = None,
+) -> OpenVendorPr | None:
+    """Return an open Vendor Verifier PR for this vendor, if one already exists."""
+    auth = _resolve_github_auth()
+    if not auth.token:
+        return None
+
+    try:
+        resp = requests.get(
+            f"{GITHUB_API}/repos/{REPO}/pulls",
+            headers=_gh_headers(auth.token),
+            params={"state": "open", "base": BASE_BRANCH, "per_page": 100},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception:
+        logger.exception("Failed to list open pull requests")
+        return None
+
+    for pr in resp.json():
+        if not _is_vendor_verifier_pr(pr):
+            continue
+        if _pr_matches_vendor(
+            pr,
+            enum_name=enum_name,
+            display_name=display_name,
+            input_vendor=input_vendor,
+            case=case,
+            alias_target_enum=alias_target_enum,
+        ):
+            return OpenVendorPr(
+                url=pr["html_url"],
+                title=pr["title"],
+                number=pr["number"],
+                branch=pr["head"]["ref"],
+            )
+    return None
+
+
+def _resolve_github_auth() -> GitHubAuth:
+    app_token, app_reason = _get_github_app_token()
+    if app_token:
+        return GitHubAuth(token=app_token, mode="github-app")
+
+    env_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if env_token:
+        return GitHubAuth(
+            token=env_token,
+            mode="env-pat",
+            reason=f"fallback because GitHub App failed: {app_reason or 'unknown'}",
+        )
+
+    secret_pat = _get_databricks_secret("vendor-validation-app", "github_token").strip()
+    if secret_pat:
+        return GitHubAuth(
+            token=secret_pat,
+            mode="secret-pat",
+            reason=f"fallback because GitHub App failed: {app_reason or 'unknown'}",
+        )
+
+    return GitHubAuth(
+        token="",
+        mode="none",
+        reason=f"GitHub App failed ({app_reason or 'unknown'}) and no PAT fallback found",
+    )
+
+
+def _get_github_token() -> str:
+    """Backward-compatible token accessor used by app/db helpers."""
+    return _resolve_github_auth().token
 
 
 def _gh_headers(token: str) -> dict[str, str]:
@@ -216,7 +399,7 @@ def _edit_device_py(content: str, enum_name: str, display_name: str) -> str:
         raise ValueError(f"{enum_name} already exists in device.py")
     if anchor not in content:
         raise ValueError("Could not find insertion anchor in device.py")
-    return content.replace(anchor, f"\n    {new_line}\n{anchor}", 1)
+    return content.replace(anchor, f"\n{new_line}{anchor}", 1)
 
 
 def _edit_types_py(content: str, enum_name: str, display_name: str) -> str:
@@ -272,12 +455,18 @@ def test_github_connection() -> tuple[bool, str]:
 
     Returns (ok, message).
     """
-    token = _get_github_token()
-    if not token:
-        return False, "GitHub token not found in secrets scope `vendor-validation-app` key `github_token`."
+    auth = _resolve_github_auth()
+    if not auth.token:
+        return False, auth.reason
     try:
-        sha = _get_staging_sha(token)
-        return True, f"Connected. `staging` branch SHA: `{sha[:10]}...`"
+        sha = _get_staging_sha(auth.token)
+        mode_label = {
+            "github-app": "GitHub App",
+            "env-pat": "PAT (env fallback)",
+            "secret-pat": "PAT (secret fallback)",
+        }.get(auth.mode, auth.mode)
+        note = f" — {auth.reason}" if auth.reason else ""
+        return True, f"Connected via {mode_label}. `staging` branch SHA: `{sha[:10]}...`{note}"
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else "?"
         if status == 401:
@@ -300,6 +489,7 @@ def create_vendor_pr(
     alias_target_enum: str | None = None,
     manuf_enum_name: str | None = None,
     manuf_original_display: str | None = None,
+    input_vendor: str | None = None,
 ) -> tuple[str, str]:
     """Create a GitHub PR with device.py and types.py changes.
 
@@ -310,11 +500,22 @@ def create_vendor_pr(
     Returns (pr_url, branch_name).
     Raises RuntimeError on failure.
     """
-    token = _get_github_token()
+    auth = _resolve_github_auth()
+    token = auth.token
     if not token:
+        raise RuntimeError(f"GitHub auth failed: {auth.reason}")
+
+    existing_pr = find_open_vendor_pr(
+        enum_name=enum_name,
+        display_name=display_name,
+        input_vendor=input_vendor,
+        case=case,
+        alias_target_enum=alias_target_enum,
+    )
+    if existing_pr:
         raise RuntimeError(
-            "GitHub token not configured. Add `github_token` to the "
-            "`vendor-validation-app` Databricks secret scope."
+            f"An open PR already exists for this vendor: #{existing_pr.number} "
+            f"({existing_pr.title}) — {existing_pr.url}"
         )
 
     branch_name = f"{jira_key}-wip/vendor-verifier/adding_{enum_name}"
@@ -362,6 +563,8 @@ def create_vendor_pr(
             _build_pr_body(display_name, jira_key, result),
             branch_name,
         )
+        if auth.mode != "github-app":
+            logger.warning("PR created with fallback auth mode=%s reason=%s", auth.mode, auth.reason)
         return pr_url, branch_name
 
     except Exception as e:

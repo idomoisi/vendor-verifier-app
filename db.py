@@ -137,10 +137,11 @@ def check_vendor_has_alias_entry(enum_name: str) -> bool:
 
 
 def load_vendor_registry() -> list[str]:
-    """Load vendor display names from device.py in the GitHub repo.
+    """Load vendor display names from device.py in the GitHub repo (codebase only).
 
     Falls back to the silver Delta table if GitHub is unavailable.
-    Also merges in previously verified normalized names from vendor_verify.
+    Does not include pending rows from vendor_verify — those are not in the
+    codebase yet and must not drive duplicate or alias detection.
     """
     from github_pr import DEVICE_PY_PATH, REPO, _get_file, _get_github_token
 
@@ -171,22 +172,7 @@ def load_vendor_registry() -> list[str]:
         finally:
             conn.close()
 
-    # Merge in previously AI-verified names from this app
-    conn = _get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                SELECT DISTINCT normalized_name
-                FROM {VENDOR_VERIFY_TABLE}
-                WHERE normalized_name IS NOT NULL AND TRIM(normalized_name) != ''
-            """)
-            verified = [row[0] for row in cur.fetchall()]
-    except Exception:
-        verified = []
-    finally:
-        conn.close()
-
-    return list(set(vendors + verified))
+    return list(set(vendors))
 
 
 def load_verified_names() -> set[str]:

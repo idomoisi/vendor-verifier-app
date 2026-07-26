@@ -45,10 +45,11 @@ def _get_connection():
     )
 
 
-def load_vendor_enum_keys() -> list[tuple[str, str]]:
+def load_vendor_enum_keys(*, include_manuf: bool = False) -> list[tuple[str, str]]:
     """Return list of (EnumName, DisplayValue) pairs from the Vendor enum in device.py.
 
-    Used to populate the alias target dropdown.
+    Used to populate the alias target dropdown. Manuf-file vendors are excluded by
+    default — they are promotion candidates, not first-class alias targets.
     Returns empty list if GitHub is unavailable.
     """
     from github_pr import DEVICE_PY_PATH, _get_file, _get_github_token
@@ -60,9 +61,15 @@ def load_vendor_enum_keys() -> list[tuple[str, str]]:
         return []
     try:
         content, _ = _get_file(token, DEVICE_PY_PATH)
-        # Match lines like:   EnumName = "Display Value"
-        # and:                 EnumName = "Display Value", VendorSource.Manuf
-        pairs = re.findall(r'^\s+(\w+)\s*=\s*"([^"]+)"', content, re.MULTILINE)
+        if include_manuf:
+            pairs = re.findall(r'^\s+(\w+)\s*=\s*"([^"]+)"', content, re.MULTILINE)
+        else:
+            # First-class only: display value with no VendorSource.Manuf suffix on the line
+            pairs = re.findall(
+                r'^\s+(\w+)\s*=\s*"([^"]+)"(?!,\s*VendorSource\.Manuf)',
+                content,
+                re.MULTILINE,
+            )
         # Filter out non-vendor lines (class attributes, etc.) by excluding lowercase starts
         return [(k, v) for k, v in pairs if k[0].isupper()]
     except Exception:
@@ -136,8 +143,12 @@ def check_vendor_has_alias_entry(enum_name: str) -> bool:
         return False
 
 
-def load_vendor_registry() -> list[str]:
-    """Load vendor display names from device.py in the GitHub repo (codebase only).
+def load_vendor_registry(*, include_manuf: bool = False) -> list[str]:
+    """Load first-class vendor display names from device.py (codebase only).
+
+    VendorSource.Manuf entries are excluded by default so Gate 1 / alias detection
+    do not treat manuf-file vendors as "already in the system" — those should flow
+    to the promote-from-manuf path instead.
 
     Falls back to the silver Delta table if GitHub is unavailable.
     Does not include pending rows from vendor_verify — those are not in the
@@ -151,11 +162,17 @@ def load_vendor_registry() -> list[str]:
     if token:
         try:
             content, _ = _get_file(token, DEVICE_PY_PATH)
-            # Match both:
-            #   EnumName = "Display Value"
-            #   EnumName = "Display Value", VendorSource.Manuf
             import re
-            vendors = re.findall(r'^\s+\w+\s*=\s*"([^"]+)"', content, re.MULTILINE)
+
+            if include_manuf:
+                vendors = re.findall(r'^\s+\w+\s*=\s*"([^"]+)"', content, re.MULTILINE)
+            else:
+                # First-class only (no VendorSource.Manuf on the same line)
+                vendors = re.findall(
+                    r'^\s+\w+\s*=\s*"([^"]+)"(?!,\s*VendorSource\.Manuf)',
+                    content,
+                    re.MULTILINE,
+                )
         except Exception:
             pass
 

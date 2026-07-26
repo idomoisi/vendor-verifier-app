@@ -290,11 +290,13 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
             }
             st.rerun()
 
-        # Step 1: Duplicate Check (codebase only)
+        # Step 1: Duplicate Check (first-class codebase vendors only — manuf excluded)
         with st.status("Checking for duplicates...", expanded=True) as dup_status:
             similar = find_similar(vendor_name, codebase_registry)
             dup = is_duplicate(similar)
             prev = get_verified_vendor(vendor_name)
+            manuf_pairs = cached_manuf_pairs()
+            manuf_gate1 = find_manuf_matches(vendor_name, threshold=0.90, preloaded_pairs=manuf_pairs)
 
             if dup:
                 match = similar[0]
@@ -329,6 +331,11 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
                     f"**`{vendor_name}`** was already verified in this app — "
                     f"skipping AI and opening ticket creation."
                 )
+                if manuf_gate1:
+                    st.info(
+                        f"Also matches manuf-file vendor **`{manuf_gate1[0][1]}`** "
+                        f"(`Vendor.{manuf_gate1[0][0]}`) — eligible for **promotion**."
+                    )
                 if similar:
                     st.caption("Similar vendors in codebase:")
                     render_similar_vendors(similar)
@@ -340,12 +347,25 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
                 )
                 skip_ai = True
 
+            elif manuf_gate1:
+                # Manuf-file only — not first-class. Continue so promote path can run.
+                best_manuf = manuf_gate1[0]
+                dup_status.update(
+                    label=f"Manuf-file entry found ({best_manuf[1]}) — eligible for promotion",
+                    state="running",
+                )
+                st.info(
+                    f"**`{vendor_name}`** matches manuf-file vendor **`{best_manuf[1]}`** "
+                    f"(`Vendor.{best_manuf[0]}`). Continuing verification so it can be **promoted** "
+                    f"to a first-class vendor."
+                )
+
             if not skip_ai:
                 if similar:
                     dup_status.update(label="Similar found (< 90%)", state="running")
                     st.warning("**Similar vendors found** (below 90% -- proceeding):")
                     render_similar_vendors(similar)
-                else:
+                elif not manuf_gate1:
                     dup_status.update(label="No duplicates", state="complete", expanded=False)
 
         if not skip_ai:
@@ -530,10 +550,12 @@ def _render_result_panel(vendor_name: str, vendor_url: str) -> None:
                 # Show fuzzy manuf matches and let user decide
                 options_display = [f"{disp} ({score:.0%} match)" for _, disp, score in manuf_matches]
                 options_display.append("None of these — add as new vendor")
+                # Strong manuf match (exact / ≥90%) → default to promote, not "new"
+                default_idx = 0 if manuf_matches[0][2] >= 0.90 else len(options_display) - 1
                 selected_manuf = st.radio(
                     "⬆️ Similar entries found in the manuf-file section. Is this a promotion?",
                     options=options_display,
-                    index=len(options_display) - 1,  # default to "None"
+                    index=default_idx,
                     key="manuf_match_select",
                 )
                 if selected_manuf == options_display[-1]:

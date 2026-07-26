@@ -346,7 +346,8 @@ def _edit_device_py_promote_manuf(
     """Promote a VendorSource.Manuf entry to a first-class system vendor.
 
     - Removes the Manuf line (matched by enum key, not display value)
-    - Inserts a clean enum entry before '# Vendors from manuf file #'
+    - Inserts a clean enum entry immediately before the blank line + manuf comment
+      (same spacing as _edit_device_py — no extra blank line)
     """
     import re
 
@@ -359,12 +360,17 @@ def _edit_device_py_promote_manuf(
         raise ValueError(f"Could not find Manuf entry for {manuf_enum_name} in device.py")
     content = content.replace(match.group(0), "", 1)
 
-    # Insert clean entry before the manuf comment
-    anchor = "    # Vendors from manuf file #"
-    new_line = f'    {new_enum_name} = "{new_display_name}"\n'
+    # Same anchor/spacing as _edit_device_py so we get:
+    #   LastVendor = "..."
+    #   NewVendor = "..."
+    #
+    #   # Vendors from manuf file #
+    # not an extra blank line before the new entry.
+    anchor = "\n\n    # Vendors from manuf file #"
+    new_line = f'    {new_enum_name} = "{new_display_name}"'
     if anchor not in content:
         raise ValueError("Could not find insertion anchor in device.py")
-    return content.replace(anchor, new_line + "\n" + anchor)
+    return content.replace(anchor, f"\n{new_line}{anchor}", 1)
 
 
 def _edit_device_py_manuf(content: str, enum_name: str, display_name: str) -> str:

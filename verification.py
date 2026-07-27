@@ -1,4 +1,4 @@
-"""Gemini Pro + Google Search vendor verification."""
+"""Gemini + Google Search vendor verification."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import time
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "gemini-2.5-pro"
+MODEL_ID = "gemini-3.6-flash"
 MAX_RETRIES = 3
 
 VERIFICATION_PROMPT = """### Role

@@ -336,6 +336,24 @@ def _edit_device_py_alias(content: str, existing_enum: str, alias_name: str) -> 
     return content
 
 
+_MANUF_SECTION_ANCHOR = "\n\n    # Vendors from manuf file #"
+
+
+def _insert_first_class_vendor_before_manuf(content: str, enum_name: str, display_name: str) -> str:
+    """Insert a first-class Vendor line flush under the previous enum entry.
+
+    Desired spacing (same for new + promote):
+        LastVendor = "..."
+        NewVendor = "..."
+
+        # Vendors from manuf file #
+    """
+    new_line = f'    {enum_name} = "{display_name}"'
+    if _MANUF_SECTION_ANCHOR not in content:
+        raise ValueError("Could not find insertion anchor in device.py")
+    return content.replace(_MANUF_SECTION_ANCHOR, f"\n{new_line}{_MANUF_SECTION_ANCHOR}", 1)
+
+
 def _edit_device_py_promote_manuf(
     content: str,
     manuf_enum_name: str,
@@ -346,8 +364,7 @@ def _edit_device_py_promote_manuf(
     """Promote a VendorSource.Manuf entry to a first-class system vendor.
 
     - Removes the Manuf line (matched by enum key, not display value)
-    - Inserts a clean enum entry immediately before the blank line + manuf comment
-      (same spacing as _edit_device_py — no extra blank line)
+    - Inserts a clean enum entry with the same spacing as _edit_device_py
     """
     import re
 
@@ -359,18 +376,7 @@ def _edit_device_py_promote_manuf(
     if not match:
         raise ValueError(f"Could not find Manuf entry for {manuf_enum_name} in device.py")
     content = content.replace(match.group(0), "", 1)
-
-    # Same anchor/spacing as _edit_device_py so we get:
-    #   LastVendor = "..."
-    #   NewVendor = "..."
-    #
-    #   # Vendors from manuf file #
-    # not an extra blank line before the new entry.
-    anchor = "\n\n    # Vendors from manuf file #"
-    new_line = f'    {new_enum_name} = "{new_display_name}"'
-    if anchor not in content:
-        raise ValueError("Could not find insertion anchor in device.py")
-    return content.replace(anchor, f"\n{new_line}{anchor}", 1)
+    return _insert_first_class_vendor_before_manuf(content, new_enum_name, new_display_name)
 
 
 def _edit_device_py_manuf(content: str, enum_name: str, display_name: str) -> str:
@@ -398,14 +404,9 @@ def _edit_device_py(content: str, enum_name: str, display_name: str) -> str:
                                     ← blank line preserved
         # Vendors from manuf file #
     """
-    # Anchor includes the blank line before the comment so we consume and rewrite it correctly
-    anchor = "\n\n    # Vendors from manuf file #"
-    new_line = f'    {enum_name} = "{display_name}"'
     if f'{enum_name} = "{display_name}"' in content:
         raise ValueError(f"{enum_name} already exists in device.py")
-    if anchor not in content:
-        raise ValueError("Could not find insertion anchor in device.py")
-    return content.replace(anchor, f"\n{new_line}{anchor}", 1)
+    return _insert_first_class_vendor_before_manuf(content, enum_name, display_name)
 
 
 def _edit_types_py(content: str, enum_name: str, display_name: str) -> str:

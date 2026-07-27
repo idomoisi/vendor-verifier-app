@@ -18,6 +18,8 @@ JIRA_ISSUE_TYPE = "Task"
 JIRA_DEFAULT_ASSIGNEE = "712020:af3f3d43-c255-456b-8230-4d2bcec470ee"  # Ido Moisi
 JIRA_TEAM_FIELD = "customfield_11259"
 JIRA_TEAM_CLASSIFICATION_ID = "16991"  # Classification (Data) — required on NET tasks
+JIRA_RD_TASK_TYPE_FIELD = "customfield_13408"  # R&D Task Type
+JIRA_RD_TASK_TYPE_VENDOR_VERIFIER_ID = "17676"  # Vendor Verifier
 
 
 def _get_jira_credentials() -> tuple[str, str]:
@@ -166,6 +168,7 @@ def create_vendor_ticket(
             "labels": ["maestro"],
             "assignee": {"id": JIRA_DEFAULT_ASSIGNEE},
             JIRA_TEAM_FIELD: {"id": JIRA_TEAM_CLASSIFICATION_ID},
+            JIRA_RD_TASK_TYPE_FIELD: {"id": JIRA_RD_TASK_TYPE_VENDOR_VERIFIER_ID},
         }
     }
 

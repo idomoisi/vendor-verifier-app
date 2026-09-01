@@ -199,6 +199,49 @@ def find_similar(
     return results[:top_n]
 
 
+def find_manuf_matches(
+    input_name: str,
+    manuf_pairs: list[tuple[str, str]],
+    threshold: float = 0.70,
+) -> list[tuple[str, str, float]]:
+    """Fuzzy-match a name against the closed VendorSource.Manuf registry."""
+    inp = normalize_cmp(input_name)
+    matches: list[tuple[str, str, float]] = []
+    for enum_key, display in manuf_pairs:
+        candidate = normalize_cmp(display)
+        if not inp or not candidate:
+            continue
+        score = 1.0 if inp == candidate else _length_aware_fuzzy(inp, candidate)
+        if score >= threshold:
+            matches.append((enum_key, display, score))
+    matches.sort(key=lambda item: item[2], reverse=True)
+    return matches
+
+
+def pick_promote_manuf(
+    typed_matches: list[tuple[str, str, float]],
+    official_matches: list[tuple[str, str, float]],
+    threshold: float = 0.90,
+) -> tuple[str, str, float] | None:
+    """Prefer a strong typed-name Manuf attribution over official-name-only."""
+    typed_strong = [match for match in typed_matches if match[2] >= threshold]
+    if typed_strong:
+        return typed_strong[0]
+    official_strong = [match for match in official_matches if match[2] >= threshold]
+    return official_strong[0] if official_strong else None
+
+
+def promote_pr_case(
+    enum_name: str,
+    display_name: str,
+    manuf_enum: str,
+    manuf_display: str,
+) -> str:
+    if enum_name != manuf_enum or display_name != manuf_display:
+        return "promote_rename"
+    return "promote"
+
+
 def sanitize_vendor_name_raw(raw: str) -> str:
     """Strip control characters (ord < 32) and zero-width / BOM codepoints."""
     out: list[str] = []
@@ -241,3 +284,87 @@ def should_skip_control_ghost(raw: str, sanitized: str) -> bool:
 def gate2_should_add_alias(verdict: str | None) -> bool:
     """Gate 2 alias PR flag — only LEGIT duplicates may queue aliases."""
     return verdict == "LEGIT"
+
+
+def find_parent_brand_match(
+    official: str, registry: list[str]
+) -> tuple[str, float, str] | None:
+    """Match compound names like 'Molex - Woodhead' to parent vendor Molex.
+
+    Returns (canonical_name, score, match_type) or None.
+    Port of Streamlit ``duplicate_check.find_parent_brand_match``.
+    """
+    official_stripped = (official or "").strip()
+    if not official_stripped:
+        return None
+
+    registry_by_norm: dict[str, str] = {}
+    for cand in registry:
+        cand_norm = normalize_cmp(cand)
+        if len(cand_norm) >= 3:
+            registry_by_norm.setdefault(cand_norm, cand)
+
+    first_segment = re.split(r"\s*[-–|/]\s*", official_stripped, maxsplit=1)[0].strip()
+    first_norm = normalize_cmp(first_segment)
+    if first_norm in registry_by_norm:
+        return registry_by_norm[first_norm], 0.98, "parent-brand"
+
+    official_norm = normalize_cmp(official_stripped)
+    for cand_norm, cand in registry_by_norm.items():
+        if len(cand_norm) < 4:
+            continue
+        if official_norm.startswith(cand_norm + " ") and official_norm != cand_norm:
+            return cand, 0.96, "parent-prefix"
+
+    return None
+
+
+def resolve_parent_for_brand_of(
+    *,
+    verdict: str | None,
+    official_name: str,
+    parent_company: str | None,
+    acquired_by: str | None,
+    registry: list[str],
+    duplicate_threshold: float = 0.90,
+) -> tuple[str, float, str] | None:
+    """P2: if BRAND-OF / parent / acquirer is known, map to an existing registry vendor.
+
+    Lookup order: explicit parent_company → acquired_by → parent-brand parse of official_name
+    → fuzzy find_similar on parent strings.
+    """
+    v = (verdict or "").strip().upper()
+    candidates: list[str] = []
+    for raw in (parent_company, acquired_by, official_name):
+        if raw in (None, "", "null", "None"):
+            continue
+        s = str(raw).strip()
+        if s and s not in candidates:
+            candidates.append(s)
+
+    # Prefer explicit parent/acquirer before official brand name.
+    ordered: list[str] = []
+    for raw in (parent_company, acquired_by):
+        if raw not in (None, "", "null", "None"):
+            s = str(raw).strip()
+            if s and s not in ordered:
+                ordered.append(s)
+    if official_name.strip() and official_name.strip() not in ordered:
+        ordered.append(official_name.strip())
+
+    if v not in {"BRAND-OF", "LEGIT"} and not (parent_company or acquired_by):
+        # Only run P2 for BRAND-OF, or when Gemini filled parent/acquired fields.
+        return None
+    if v == "LEGIT" and not (parent_company or acquired_by):
+        return None
+
+    for name in ordered:
+        parent = find_parent_brand_match(name, registry)
+        if parent:
+            return parent
+        similar = find_similar(name, registry, threshold=0.70, top_n=3,
+                               duplicate_threshold=duplicate_threshold)
+        if similar and (similar[0][2] == "exact" or similar[0][1] >= duplicate_threshold):
+            return similar[0][0], float(similar[0][1]), f"parent-similar:{similar[0][2]}"
+
+    return None

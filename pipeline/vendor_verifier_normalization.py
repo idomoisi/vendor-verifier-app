@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 import re
+import unicodedata
+
+_LATIN_EXPANSIONS = {
+    "Æ": "AE", "æ": "ae", "Œ": "OE", "œ": "oe", "ß": "ss",
+    "Ø": "O", "ø": "o", "Ð": "D", "ð": "d", "Þ": "Th", "þ": "th",
+    "Ł": "L", "ł": "l", "Đ": "D", "đ": "d", "Ħ": "H", "ħ": "h",
+    "Ŋ": "N", "ŋ": "n", "Ŧ": "T", "ŧ": "t",
+}
 
 _LEGAL_SUFFIXES = (
     ", Inc.",
@@ -28,7 +36,19 @@ _LEGAL_SUFFIXES = (
 )
 
 
+def to_ascii_name(name: str) -> str:
+    expanded = "".join(_LATIN_EXPANSIONS.get(char, char) for char in name)
+    decomposed = unicodedata.normalize("NFKD", expanded)
+    ascii_only = "".join(
+        char
+        for char in decomposed
+        if ord(char) < 128 and not unicodedata.combining(char)
+    )
+    return re.sub(r"\s+", " ", ascii_only).strip()
+
+
 def clean_official_name(name: str) -> str:
+    name = to_ascii_name(name)
     name = re.split(r",\s+a\s+", name, maxsplit=1)[0]
     name = re.split(r"\s+d\.b\.a\.", name, flags=re.IGNORECASE, maxsplit=1)[0]
     name = re.split(r"\s+-\s+[Aa]\s+", name, maxsplit=1)[0]

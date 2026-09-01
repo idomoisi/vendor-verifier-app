@@ -25,6 +25,8 @@ REPO = "medigateio/medigator"
 BASE_BRANCH = "staging"
 DEVICE_PY_PATH = "medigator/common/domain_model/xiot/device.py"
 TYPES_PY_PATH = "medigator/common/domain_model/intels/vulnerabilities/types.py"
+OUI_INFO_PY_PATH = "medigator/common/domain_model/oui_info.py"
+IEEE_MANUF_PATH = "medigator/resources/manuf"
 SECRET_SCOPE = "vendor-validation-app"
 
 
@@ -42,6 +44,11 @@ class BatchPrRow:
     website: str | None
     hardware_evidence: str | None
     supported_protocols: str | None
+    pr_case: str = "new"
+    manuf_enum: str | None = None
+    manuf_original_display: str | None = None
+    manuf_source: str | None = None
+    manuf_ieee_short: str | None = None
 
 
 def _get_secret(get_secret: Callable[[str, str], str], key: str) -> str:
@@ -181,12 +188,17 @@ def _edit_types_py(content: str, enum_name: str, display_name: str) -> str:
 
 
 def _edit_device_py_alias(content: str, existing_enum: str, alias_name: str) -> str:
-    if f'"{alias_name}"' in content:
-        return content
     existing_entry = f"Vendor.{existing_enum}: ("
     new_alias_line = f'        "{alias_name}",\n'
     if existing_entry in content:
-        close_paren_idx = content.index("\n    ),", content.index(existing_entry))
+        entry_start = content.index(existing_entry)
+        close_paren_idx = content.index("\n    ),", entry_start)
+        if f'"{alias_name}"' in content[entry_start:close_paren_idx]:
+            return content
+        if f'"{alias_name}"' in content:
+            raise ValueError(
+                f'Alias "{alias_name}" already belongs to another Vendor entry'
+            )
         return (
             content[:close_paren_idx]
             + "\n"
@@ -194,11 +206,137 @@ def _edit_device_py_alias(content: str, existing_enum: str, alias_name: str) -> 
             + "    ),"
             + content[close_paren_idx + len("\n    ),") :]
         )
+    if f'"{alias_name}"' in content:
+        raise ValueError(f'Alias "{alias_name}" already exists elsewhere in device.py')
     aliases_close = "}\n\nassert all(\n    isinstance(value, tuple)"
     if aliases_close not in content:
         raise ValueError("Could not find end of VENDOR_ALIASES in device.py")
     new_entry = f'    Vendor.{existing_enum}: (\n        "{alias_name}",\n    ),\n'
     return content.replace(aliases_close, new_entry + aliases_close)
+
+
+def _edit_device_py_promote(
+    content: str,
+    manuf_enum: str,
+    new_enum: str,
+    new_display: str,
+) -> str:
+    match = re.search(
+        rf'^\s+{re.escape(manuf_enum)}\s*=\s*"[^"]+",\s*VendorSource\.Manuf\n',
+        content,
+        re.MULTILINE,
+    )
+    if not match:
+        raise ValueError(f"Could not find Manuf entry for {manuf_enum}")
+    content = content.replace(match.group(0), "", 1)
+    return _edit_device_py(content, new_enum, new_display)
+
+
+def _edit_oui_info(
+    content: str,
+    old_enum: str,
+    new_enum: str,
+) -> tuple[str, int]:
+    if old_enum == new_enum:
+        return content, 0
+    pattern = re.compile(rf"(?<!\w)Vendor\.{re.escape(old_enum)}(?!\w)")
+    return pattern.subn(f"Vendor.{new_enum}", content)
+
+
+def _edit_oui_info_ieee_promote(
+    content: str,
+    ieee_long_name: str,
+    ieee_short_name: str,
+    new_enum_name: str,
+) -> tuple[str, int]:
+    from vendor_verifier_ieee_manuf import parse_oui_vendor_mappings
+
+    mappings = parse_oui_vendor_mappings(content)
+    lines: list[str] = []
+    for key in dict.fromkeys((ieee_long_name, ieee_short_name.upper())):
+        existing = mappings.get(key)
+        if existing and existing != new_enum_name:
+            raise ValueError(f"IEEE OUI key {key!r} already maps to Vendor.{existing}")
+        if existing is None:
+            lines.append(f"    {json.dumps(key, ensure_ascii=False)}: Vendor.{new_enum_name},")
+    if not lines:
+        return content, 0
+    close = content.rfind("\n}")
+    if close < 0:
+        raise ValueError("Could not find end of OUI_TO_VENDOR")
+    return content[:close] + "\n" + "\n".join(lines) + content[close:], len(lines)
+
+
+def load_vendor_source(
+    get_secret: Callable[[str, str], str],
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Load first-class names and the closed Manuf registry from medigator staging."""
+    token, _ = _resolve_github_auth(get_secret)
+    if not token:
+        raise RuntimeError("GitHub auth failed while loading Vendor registry")
+    device_content, _ = _get_file(token, DEVICE_PY_PATH)
+    vendor_start = device_content.find("class Vendor(")
+    manuf_anchor = device_content.find("# Vendors from manuf file #", vendor_start)
+    if vendor_start < 0 or manuf_anchor < 0:
+        raise ValueError("Could not locate Vendor/Manuf sections in device.py")
+    first_class = [
+        display
+        for _enum, display in re.findall(
+            r'^\s+(\w+)\s*=\s*"([^"]+)"\s*$',
+            device_content[vendor_start:manuf_anchor],
+            re.MULTILINE,
+        )
+    ]
+    manuf_pairs = re.findall(
+        r'^\s+(\w+)\s*=\s*"([^"]+)",\s*VendorSource\.Manuf\s*$',
+        device_content,
+        re.MULTILINE,
+    )
+    return first_class, manuf_pairs
+
+
+def load_vendor_sources(
+    get_secret: Callable[[str, str], str],
+):
+    """Load enum-backed and IEEE-backed Manuf identities plus OUI mappings."""
+    from vendor_verifier_ieee_manuf import (
+        parse_ieee_manuf_pairs,
+        parse_oui_vendor_mappings,
+    )
+
+    token, _ = _resolve_github_auth(get_secret)
+    if not token:
+        raise RuntimeError("GitHub auth failed while loading Vendor registries")
+    device_content, _ = _get_file(token, DEVICE_PY_PATH)
+    vendor_start = device_content.find("class Vendor(")
+    manuf_anchor = device_content.find("# Vendors from manuf file #", vendor_start)
+    if vendor_start < 0 or manuf_anchor < 0:
+        raise ValueError("Could not locate Vendor/Manuf sections in device.py")
+    first_class_pairs = re.findall(
+        r'^\s+(\w+)\s*=\s*"([^"]+)"\s*$',
+        device_content[vendor_start:manuf_anchor],
+        re.MULTILINE,
+    )
+    first_class = [display for _enum, display in first_class_pairs]
+    manuf_pairs = re.findall(
+        r'^\s+(\w+)\s*=\s*"([^"]+)",\s*VendorSource\.Manuf\s*$',
+        device_content,
+        re.MULTILINE,
+    )
+    manuf_content, _ = _get_file(token, IEEE_MANUF_PATH)
+    oui_content, _ = _get_file(token, OUI_INFO_PY_PATH)
+    return (
+        first_class,
+        manuf_pairs,
+        parse_ieee_manuf_pairs(manuf_content),
+        parse_oui_vendor_mappings(oui_content),
+        dict(first_class_pairs),
+    )
+
+
+def load_manuf_pairs(get_secret: Callable[[str, str], str]) -> list[tuple[str, str]]:
+    """Compatibility wrapper for callers that only need Manuf rows."""
+    return load_vendor_source(get_secret)[1]
 
 
 def resolve_vendor_enum_key(device_py: str, canonical_display: str) -> str | None:
@@ -225,9 +363,9 @@ def _build_batch_pr_body(rows: list[BatchPrRow], pr_mode: str, run_id: str) -> s
             case = "alias"
             target = row.duplicate_of or "?"
         else:
-            case = "new vendor"
+            case = f"`{row.pr_case}`"
             if row.should_add_alias:
-                case = "new vendor + alias"
+                case += " + raw alias"
             target = row.official_name or row.vendor_name_raw
         lines.append(
             f"| [{row.jira_ticket}](https://team82.atlassian.net/browse/{row.jira_ticket}) "
@@ -237,31 +375,86 @@ def _build_batch_pr_body(rows: list[BatchPrRow], pr_mode: str, run_id: str) -> s
     return "\n".join(lines)
 
 
-def apply_batch_edits(device_content: str, types_content: str, rows: list[BatchPrRow]) -> tuple[str, str]:
+def apply_batch_edits(
+    device_content: str,
+    types_content: str,
+    oui_content: str,
+    rows: list[BatchPrRow],
+) -> tuple[str, str, str, list[BatchPrRow]]:
     new_rows = [r for r in rows if r.status == "COMPLETED"]
     alias_rows = [r for r in rows if r.status == "DUPLICATE" and r.should_add_alias]
+    applied: list[BatchPrRow] = []
 
     for row in new_rows:
+        before = device_content, types_content, oui_content
         enum_name = row.enum_name or ""
         official = row.official_name or row.vendor_name_raw
-        if not enum_name:
-            raise ValueError(f"Missing enum_name for new vendor row {row.vendor_name_raw!r}")
-        device_content = _edit_device_py(device_content, enum_name, official)
-        types_content = _edit_types_py(types_content, enum_name, official)
-        if row.should_add_alias and row.vendor_name_raw.strip() != official.strip():
-            device_content = _edit_device_py_alias(device_content, enum_name, row.vendor_name_raw)
+        try:
+            if not enum_name:
+                raise ValueError(f"Missing enum_name for new vendor row {row.vendor_name_raw!r}")
+            if row.pr_case in ("promote", "promote_rename"):
+                if not row.manuf_original_display:
+                    raise ValueError("Manuf promotion is missing its source display")
+                if row.manuf_source == "ieee":
+                    if not row.manuf_ieee_short:
+                        raise ValueError("IEEE promotion is missing its short name")
+                    device_content = _edit_device_py(
+                        device_content, enum_name, official
+                    )
+                    oui_content, _ = _edit_oui_info_ieee_promote(
+                        oui_content,
+                        row.manuf_original_display,
+                        row.manuf_ieee_short,
+                        enum_name,
+                    )
+                else:
+                    if not row.manuf_enum:
+                        raise ValueError("Enum promotion is missing its source enum")
+                    device_content = _edit_device_py_promote(
+                        device_content, row.manuf_enum, enum_name, official
+                    )
+                if (
+                    row.pr_case == "promote_rename"
+                    and row.manuf_original_display != official
+                ):
+                    device_content = _edit_device_py_alias(
+                        device_content, enum_name, row.manuf_original_display
+                    )
+                if row.pr_case == "promote_rename" and row.manuf_source != "ieee":
+                    oui_content, _ = _edit_oui_info(
+                        oui_content, row.manuf_enum, enum_name
+                    )
+            else:
+                device_content = _edit_device_py(device_content, enum_name, official)
+            types_content = _edit_types_py(types_content, enum_name, official)
+            if row.should_add_alias and row.vendor_name_raw.strip() != official.strip():
+                device_content = _edit_device_py_alias(
+                    device_content, enum_name, row.vendor_name_raw
+                )
+            applied.append(row)
+        except Exception:
+            device_content, types_content, oui_content = before
+            logger.exception("Omitting failed batch vendor %r", row.vendor_name_raw)
 
     for row in alias_rows:
-        canonical = row.duplicate_of or row.official_name or ""
-        enum_key = resolve_vendor_enum_key(device_content, canonical)
-        if not enum_key:
-            raise ValueError(
-                f"Could not resolve enum key for alias target {canonical!r} "
-                f"(raw={row.vendor_name_raw!r})"
+        before = device_content
+        try:
+            canonical = row.duplicate_of or row.official_name or ""
+            enum_key = resolve_vendor_enum_key(device_content, canonical)
+            if not enum_key:
+                raise ValueError(
+                    f"Could not resolve enum key for alias target {canonical!r} "
+                    f"(raw={row.vendor_name_raw!r})"
+                )
+            device_content = _edit_device_py_alias(
+                device_content, enum_key, row.vendor_name_raw
             )
-        device_content = _edit_device_py_alias(device_content, enum_key, row.vendor_name_raw)
+            applied.append(row)
+        except Exception:
+            device_content = before
+            logger.exception("Omitting failed batch alias %r", row.vendor_name_raw)
 
-    return device_content, types_content
+    return device_content, types_content, oui_content, applied
 
 
 def create_batch_pr(
@@ -271,7 +464,7 @@ def create_batch_pr(
     run_id: str,
     get_secret: Callable[[str, str], str],
     link_jira: bool = True,
-) -> str | None:
+) -> tuple[str, list[BatchPrRow]] | None:
     if not rows:
         return None
 
@@ -282,23 +475,37 @@ def create_batch_pr(
     date_suffix = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
     lead_ticket = rows[0].jira_ticket
     branch_name = f"{lead_ticket}-wip/vendor-verifier/batch-{date_suffix}"
-    commit_message = f"{lead_ticket}: [Vendor Verifier] Batch {pr_mode} — {len(rows)} changes"
-    pr_title = f"{lead_ticket}: [Vendor Verifier] Batch PR ({pr_mode}) — {len(rows)} changes"
 
     staging_sha = _get_staging_sha(token)
-    _create_branch(token, branch_name, staging_sha)
-
     device_content, device_sha = _get_file(token, DEVICE_PY_PATH)
     types_content, types_sha = _get_file(token, TYPES_PY_PATH)
-    device_content, types_content = apply_batch_edits(device_content, types_content, rows)
+    oui_content, oui_sha = _get_file(token, OUI_INFO_PY_PATH)
+    original_oui = oui_content
+    device_content, types_content, oui_content, applied = apply_batch_edits(
+        device_content, types_content, oui_content, rows
+    )
+    if not applied:
+        logger.error("All batch rows failed edit validation; PR not opened")
+        return None
 
+    change_count = len(applied)
+    commit_message = (
+        f"{lead_ticket}: [Vendor Verifier] Batch {pr_mode} — {change_count} changes"
+    )
+    pr_title = (
+        f"{lead_ticket}: [Vendor Verifier] Batch PR ({pr_mode}) — "
+        f"{change_count} changes"
+    )
+    _create_branch(token, branch_name, staging_sha)
     _push_file(token, DEVICE_PY_PATH, device_content, device_sha, branch_name, commit_message)
     _push_file(token, TYPES_PY_PATH, types_content, types_sha, branch_name, commit_message)
+    if oui_content != original_oui:
+        _push_file(token, OUI_INFO_PY_PATH, oui_content, oui_sha, branch_name, commit_message)
 
     pr_url = _open_pr(
         token,
         pr_title,
-        _build_batch_pr_body(rows, pr_mode, run_id),
+        _build_batch_pr_body(applied, pr_mode, run_id),
         branch_name,
     )
     if auth_mode != "github-app":
@@ -308,13 +515,13 @@ def create_batch_pr(
         email = get_secret(SECRET_SCOPE, "jira_email")
         jira_token = get_secret(SECRET_SCOPE, "jira_api_token")
         if email and jira_token:
-            for row in rows:
+            for row in applied:
                 try:
                     link_pr_to_jira(row.jira_ticket, pr_url, email=email, token=jira_token)
                 except Exception:
                     logger.exception("Failed linking PR to %s", row.jira_ticket)
 
-    return pr_url
+    return pr_url, applied
 
 
 def _esc_sql(value: str) -> str:
@@ -337,13 +544,17 @@ def create_batch_pr_from_spark(
         SELECT
             vendor_name_raw, jira_ticket, status, verdict, confidence_score,
             official_name, enum_name, duplicate_of, should_add_alias,
-            website, hardware_evidence, supported_protocols
+            website, hardware_evidence, supported_protocols,
+            pr_case, manuf_enum, manuf_original_display,
+            manuf_source, manuf_ieee_short
         FROM {candidates_table}
         WHERE jira_ticket IS NOT NULL
           AND (pr_url IS NULL OR TRIM(pr_url) = '')
           AND (
                 (status = 'COMPLETED' AND verdict = 'LEGIT'
-                 AND confidence_score IN ({conf_list}))
+                 AND confidence_score IN ({conf_list})
+                 AND COALESCE(distinct_companies_found, 1) = 1
+                 AND (is_original_manufacturer IS NULL OR is_original_manufacturer = true))
              OR (status = 'DUPLICATE' AND should_add_alias = true)
           )
         ORDER BY orgs_count DESC NULLS LAST, vendor_name_raw
@@ -368,15 +579,21 @@ def create_batch_pr_from_spark(
             website=r.website,
             hardware_evidence=r.hardware_evidence,
             supported_protocols=r.supported_protocols,
+            pr_case=r.pr_case or "new",
+            manuf_enum=r.manuf_enum,
+            manuf_original_display=r.manuf_original_display,
+            manuf_source=r.manuf_source,
+            manuf_ieee_short=r.manuf_ieee_short,
         )
         for r in pending
     ]
     print(f"  Opening batch PR for {len(rows)} row(s)...")
-    pr_url = create_batch_pr(rows, pr_mode=pr_mode, run_id=run_id, get_secret=get_secret)
-    if not pr_url:
+    result = create_batch_pr(rows, pr_mode=pr_mode, run_id=run_id, get_secret=get_secret)
+    if not result:
         return None
+    pr_url, applied = result
 
-    tickets_sql = ", ".join(f"'{_esc_sql(r.vendor_name_raw)}'" for r in rows)
+    tickets_sql = ", ".join(f"'{_esc_sql(r.vendor_name_raw)}'" for r in applied)
     spark.sql(
         f"""
         UPDATE {candidates_table}

@@ -66,7 +66,7 @@ if _PIPELINE_LIB not in sys.path:
     sys.path.insert(0, _PIPELINE_LIB)
 
 # ── Run mode ──────────────────────────────────────────────────────────────────
-# mega_backfill: unlimited VERIFY for one-time backfill (CREATE_PR manual after review)
+# mega_backfill: capped VERIFY for one-time / follow-up mega batches (CREATE_PR manual after review)
 # weekly:        scheduled job — VERIFY cap 50, CREATE_PR automatic
 dbutils.widgets.text("RUN_MODE", "mega_backfill")
 RUN_MODE = dbutils.widgets.get("RUN_MODE")
@@ -87,7 +87,9 @@ MIN_ORGS_COUNT = 1        # Only process vendors seen in at least N orgs
 FORCE_REVERIFY = False    # True = re-verify even if already COMPLETED / DUPLICATE / FAILED
 
 if RUN_MODE == "mega_backfill":
-    MAX_VENDORS_PER_RUN = 0
+    # Second mega (Aug 2026): top 80 by orgs/events after skipping COMPLETED/DUPLICATE/FAILED.
+    # Set 0 only if you intentionally want unlimited VERIFY.
+    MAX_VENDORS_PER_RUN = 80
 elif RUN_MODE == "weekly":
     MAX_VENDORS_PER_RUN = 50
     CREATE_TICKETS = True
@@ -183,9 +185,14 @@ spark.sql(f"""
         pipeline_run_id     STRING,               -- run_id that last touched this row
 
         -- Gemini verification output
-        verdict             STRING,               -- LEGIT | SOFTWARE-ONLY | SUSPICIOUS
+        verdict             STRING,               -- LEGIT | NOT-MANUFACTURER | BRAND-OF | AMBIGUOUS | GENERIC | SOFTWARE-ONLY | SUSPICIOUS
         official_name       STRING,               -- AI-corrected canonical name
         enum_name           STRING,               -- PascalCase enum value for device.py
+        pr_case             STRING,               -- new | alias | promote | promote_rename
+        manuf_enum          STRING,               -- selected VendorSource.Manuf enum
+        manuf_original_display STRING,             -- selected Manuf display before promotion
+        manuf_source        STRING,               -- enum | ieee
+        manuf_ieee_short    STRING,               -- IEEE short name when source=ieee
         confidence_score    STRING,               -- HIGH | MEDIUM | LOW
         website             STRING,
         hardware_evidence   STRING,
@@ -198,6 +205,11 @@ spark.sql(f"""
         technical_artifacts STRING,               -- JSON array of URLs
         search_grounded     BOOLEAN,
         raw_ai_output       STRING,               -- full Gemini response (truncated to 8 KB)
+        -- P1 taxonomy fields
+        distinct_companies_found INT,             -- how many distinct companies Gemini found
+        alternative_companies STRING,             -- JSON list of {{name, website?}} for AMBIGUOUS
+        is_original_manufacturer BOOLEAN,         -- False for distributors / integrators / assemblers
+        parent_company      STRING,               -- set when BRAND-OF
 
         -- Alias routing (DUPLICATE gates + LEGIT name normalization)
         duplicate_of        STRING,               -- canonical vendor: existing match OR new official_name
@@ -230,6 +242,15 @@ for _col, _type in (
     ("jira_ticket", "STRING"),
     ("pr_url", "STRING"),
     ("pr_batch_id", "STRING"),
+    ("distinct_companies_found", "INT"),
+    ("alternative_companies", "STRING"),
+    ("is_original_manufacturer", "BOOLEAN"),
+    ("parent_company", "STRING"),
+    ("pr_case", "STRING"),
+    ("manuf_enum", "STRING"),
+    ("manuf_original_display", "STRING"),
+    ("manuf_source", "STRING"),
+    ("manuf_ieee_short", "STRING"),
 ):
     if _col not in _existing_cols:
         spark.sql(f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN {_col} {_type}")
@@ -531,8 +552,15 @@ log_start(STAGE, rows_in=len(candidates))
 
 from vendor_verifier_normalization import generate_enum_name, clean_official_name
 from vendor_verifier_similarity import (
+    find_manuf_matches,
     find_similar as _find_similar_impl,
     gate2_should_add_alias,
+    pick_promote_manuf,
+    promote_pr_case,
+    resolve_parent_for_brand_of,
+)
+from vendor_verifier_ieee_manuf import (
+    resolve_ieee_manuf,
 )
 
 
@@ -558,35 +586,59 @@ def find_similar(input_name: str, registry: list,
 
 # ── Gemini prompt + helpers ───────────────────────────────────────────────────
 VERIFICATION_PROMPT = """### Role
-You are a Technical Asset Discovery Specialist. Verify if this vendor manufactures physical, network-connected OT or Medical hardware.
+You are a Technical Asset Discovery Specialist. Classify unknown vendor strings from OT/IoMT asset discovery logs.
 
-**Vendor:** {vendor_name}
-**Website:** {vendor_url}
+**Vendor string from log:** {vendor_name}
+**Website hint:** {vendor_url}
 
-Use Google Search. Look for: physical datasheets (dimensions, weight, power specs), network stack evidence, OT/IoMT protocols, IEEE OUI registration, firmware portals.
+Use Google Search. Decide whether this string maps to exactly one original hardware manufacturer, several companies (homonym), a non-manufacturer brand, or a generic/non-company token.
+
+Look for: physical datasheets (dimensions, weight, power specs), network stack evidence, OT/IoMT protocols, IEEE OUI registration, firmware portals, parent/owner relationships, and whether multiple unrelated companies share the same name.
 
 Respond ONLY with valid JSON:
 {{
-    "verdict": "LEGIT or SOFTWARE-ONLY or SUSPICIOUS",
-    "official_name": "Official company name with correct capitalisation",
-    "website": "Official URL",
-    "hardware_evidence": "2-3 physical products with specific specs",
-    "networking_proof": "Network communication evidence",
-    "supported_protocols": ["list", "of", "protocols"],
+    "verdict": "LEGIT or NOT-MANUFACTURER or BRAND-OF or AMBIGUOUS or GENERIC or SOFTWARE-ONLY or SUSPICIOUS",
+    "official_name": "Best single official name if one exists, else empty",
+    "website": "Official URL or empty",
+    "is_original_manufacturer": true,
+    "parent_company": "Parent/owner if BRAND-OF, else null",
+    "acquired_by": "Acquirer if known, else null",
+    "distinct_companies_found": 1,
+    "alternative_companies": [{{"name": "Company A", "website": "https://..."}}],
+    "hardware_evidence": "2-3 physical products with specific specs, or n/a",
+    "networking_proof": "Network communication evidence or n/a",
+    "supported_protocols": ["list"],
     "mac_oui_check": "Yes/No/Unknown",
-    "technical_artifacts": ["URLs to datasheets/manuals"],
-    "analyst_note": "OEM/white-label observations",
-    "device_types": ["device types manufactured"],
+    "technical_artifacts": ["URLs"],
+    "analyst_note": "Why this verdict; list collisions explicitly for AMBIGUOUS",
+    "device_types": ["types"],
     "industries": ["Healthcare", "Industrial", "Enterprise"],
     "confidence_score": "HIGH/MEDIUM/LOW"
-}}"""
+}}
+
+Rules:
+- If the string matches ≥2 distinct real companies → verdict AMBIGUOUS, distinct_companies_found ≥ 2, fill alternative_companies. Do NOT pick one arbitrarily.
+- If distributor / reseller / integrator / retailer / assembler / system builder (not original manufacturer) → NOT-MANUFACTURER and is_original_manufacturer=false.
+- If brand/subsidiary/white-label of another company → BRAND-OF and set parent_company (use the owning/parent company name).
+- If the brand is widely rebranded / multi-affiliated Chinese industrial PC OEM (e.g. also sold as Iwill / Xin Secco / Yanqin / Ennoconn group brands) and you cannot name one unambiguous first-party manufacturer → AMBIGUOUS or BRAND-OF, never LEGIT.
+- If product category, acronym, model number, OCR garbage, BIOS OEMID remnant, or control-character remnant → GENERIC (do NOT invent the most plausible company).
+- SOFTWARE-ONLY for OS/cloud/firmware/software brands with no network-connected hardware OEM story.
+- LEGIT only when original manufacturer of network-connected OT/IoMT/enterprise hardware AND distinct_companies_found == 1 AND is_original_manufacturer=true AND no parent/owner brand relationship.
+"""
 
 REQUIRED_FIELDS = {
     "verdict", "official_name", "website", "hardware_evidence",
     "networking_proof", "supported_protocols", "mac_oui_check",
     "technical_artifacts", "analyst_note", "device_types", "industries",
 }
-VALID_VERDICTS = {"LEGIT", "SOFTWARE-ONLY", "SUSPICIOUS"}
+VALID_VERDICTS = {
+    "LEGIT", "NOT-MANUFACTURER", "BRAND-OF", "AMBIGUOUS", "GENERIC",
+    "SOFTWARE-ONLY", "SUSPICIOUS",
+}
+NON_PR_VERDICTS = {
+    "NOT-MANUFACTURER", "BRAND-OF", "AMBIGUOUS", "GENERIC",
+    "SOFTWARE-ONLY", "SUSPICIOUS",
+}
 
 def _extract_json(text: str) -> dict | None:
     if not text:
@@ -614,6 +666,25 @@ def _validate(data: dict) -> tuple:
     if v and v not in VALID_VERDICTS:
         errors.append(f"Bad verdict: {v!r}")
     return len(errors) == 0, errors
+
+
+def is_new_vendor_auto_pr_eligible(result: dict | None, *, confidence: str | None = None) -> bool:
+    """P1 gate: LEGIT + original manufacturer + unique company + confidence band."""
+    d = result or {}
+    verdict = (d.get("verdict") or "").strip()
+    if verdict != "LEGIT":
+        return False
+    conf = (confidence if confidence is not None else d.get("confidence_score") or "").strip().upper()
+    if conf not in AUTO_PR_CONFIDENCES:
+        return False
+    if d.get("is_original_manufacturer") is False:
+        return False
+    distinct = d.get("distinct_companies_found")
+    if isinstance(distinct, int) and distinct != 1:
+        return False
+    if isinstance(distinct, str) and distinct.strip().isdigit() and int(distinct.strip()) != 1:
+        return False
+    return True
 
 def gemini_verify(vendor_name: str, gemini_key: str) -> tuple:
     from google import genai
@@ -656,6 +727,11 @@ def _upsert_candidate(vendor_name_raw: str, cx_row: dict, *,
                       search_grounded: bool = False,
                       official_name: str = "",
                       enum_name: str = "",
+                      pr_case: str = "",
+                      manuf_enum: str = "",
+                      manuf_original_display: str = "",
+                      manuf_source: str = "",
+                      manuf_ieee_short: str = "",
                       duplicate_of: str = "",
                       duplicate_score: float = 0.0,
                       duplicate_gate: str = "",
@@ -665,6 +741,34 @@ def _upsert_candidate(vendor_name_raw: str, cx_row: dict, *,
     msg_json  = json.dumps(list(cx_row.get("message_examples") or []))
 
     verified_at_expr = "current_timestamp()" if status == "COMPLETED" else "NULL"
+
+    distinct_raw = d.get("distinct_companies_found")
+    if isinstance(distinct_raw, bool):
+        distinct_sql = "NULL"
+    elif isinstance(distinct_raw, int):
+        distinct_sql = str(int(distinct_raw))
+    elif isinstance(distinct_raw, str) and distinct_raw.strip().lstrip("-").isdigit():
+        distinct_sql = str(int(distinct_raw.strip()))
+    else:
+        distinct_sql = "NULL"
+
+    alts = d.get("alternative_companies")
+    if isinstance(alts, str):
+        alts_json = alts
+    else:
+        alts_json = json.dumps(alts or [])
+
+    oem = d.get("is_original_manufacturer")
+    if isinstance(oem, bool):
+        oem_sql = str(oem).lower()
+    else:
+        oem_sql = "NULL"
+
+    parent = d.get("parent_company")
+    if parent in (None, "null", "None"):
+        parent_sql = ""
+    else:
+        parent_sql = str(parent)
 
     spark.sql(f"""
         MERGE INTO {CANDIDATES_TABLE} AS t
@@ -680,6 +784,11 @@ def _upsert_candidate(vendor_name_raw: str, cx_row: dict, *,
             '{_esc(d.get("verdict",""))}'                           AS verdict,
             '{_esc(official_name)}'                                 AS official_name,
             '{_esc(enum_name)}'                                     AS enum_name,
+            '{_esc(pr_case)}'                                       AS pr_case,
+            '{_esc(manuf_enum)}'                                    AS manuf_enum,
+            '{_esc(manuf_original_display)}'                        AS manuf_original_display,
+            '{_esc(manuf_source)}'                                  AS manuf_source,
+            '{_esc(manuf_ieee_short)}'                              AS manuf_ieee_short,
             '{_esc(d.get("confidence_score",""))}'                  AS confidence_score,
             '{_esc(d.get("website",""))}'                           AS website,
             '{_esc(d.get("hardware_evidence",""))}'                 AS hardware_evidence,
@@ -696,7 +805,11 @@ def _upsert_candidate(vendor_name_raw: str, cx_row: dict, *,
             {float(duplicate_score)}                                AS duplicate_score,
             '{_esc(duplicate_gate)}'                                AS duplicate_gate,
             {str(should_add_alias).lower()}                         AS should_add_alias,
-            '{_esc(str(cx_row.get("channel") or ""))}'              AS channel
+            '{_esc(str(cx_row.get("channel") or ""))}'              AS channel,
+            {distinct_sql}                                          AS distinct_companies_found,
+            '{_esc(alts_json)}'                                     AS alternative_companies,
+            {oem_sql}                                               AS is_original_manufacturer,
+            '{_esc(parent_sql)}'                                    AS parent_company
         ) AS s ON t.vendor_name_raw = s.vendor_name_raw
         WHEN MATCHED THEN UPDATE SET
             t.orgs_count        = s.orgs_count,
@@ -709,6 +822,11 @@ def _upsert_candidate(vendor_name_raw: str, cx_row: dict, *,
             t.verdict           = NULLIF(s.verdict, ''),
             t.official_name     = NULLIF(s.official_name, ''),
             t.enum_name         = NULLIF(s.enum_name, ''),
+            t.pr_case           = NULLIF(s.pr_case, ''),
+            t.manuf_enum        = NULLIF(s.manuf_enum, ''),
+            t.manuf_original_display = NULLIF(s.manuf_original_display, ''),
+            t.manuf_source      = NULLIF(s.manuf_source, ''),
+            t.manuf_ieee_short  = NULLIF(s.manuf_ieee_short, ''),
             t.confidence_score  = NULLIF(s.confidence_score, ''),
             t.website           = NULLIF(s.website, ''),
             t.hardware_evidence = NULLIF(s.hardware_evidence, ''),
@@ -726,21 +844,32 @@ def _upsert_candidate(vendor_name_raw: str, cx_row: dict, *,
             t.duplicate_gate    = NULLIF(s.duplicate_gate, ''),
             t.should_add_alias  = s.should_add_alias,
             t.channel           = NULLIF(s.channel, ''),
+            t.distinct_companies_found = s.distinct_companies_found,
+            t.alternative_companies = NULLIF(s.alternative_companies, '[]'),
+            t.is_original_manufacturer = s.is_original_manufacturer,
+            t.parent_company    = NULLIF(s.parent_company, ''),
             t.last_seen         = current_timestamp(),
             t.verified_at       = {verified_at_expr}
         WHEN NOT MATCHED THEN INSERT (
             vendor_name_raw, orgs_count, events, orgs, message_examples,
             status, failure_counter, pipeline_run_id,
-            verdict, official_name, enum_name, confidence_score,
+            verdict, official_name, enum_name, pr_case, manuf_enum,
+            manuf_original_display, manuf_source, manuf_ieee_short,
+            confidence_score,
             website, hardware_evidence, networking_proof, supported_protocols,
             mac_oui_check, device_types, industries, analyst_note,
             technical_artifacts, search_grounded, raw_ai_output,
             duplicate_of, duplicate_score, duplicate_gate, should_add_alias, channel,
+            distinct_companies_found, alternative_companies,
+            is_original_manufacturer, parent_company,
             first_seen, last_seen, verified_at
         ) VALUES (
             s.vendor_name_raw, s.orgs_count, s.events, s.orgs, s.message_examples,
             s.status, s.failure_delta, s.pipeline_run_id,
             NULLIF(s.verdict,''), NULLIF(s.official_name,''), NULLIF(s.enum_name,''),
+            NULLIF(s.pr_case,''), NULLIF(s.manuf_enum,''),
+            NULLIF(s.manuf_original_display,''),
+            NULLIF(s.manuf_source,''), NULLIF(s.manuf_ieee_short,''),
             NULLIF(s.confidence_score,''), NULLIF(s.website,''),
             NULLIF(s.hardware_evidence,''), NULLIF(s.networking_proof,''),
             NULLIF(s.supported_protocols,'[]'), NULLIF(s.mac_oui_check,''),
@@ -749,6 +878,8 @@ def _upsert_candidate(vendor_name_raw: str, cx_row: dict, *,
             s.search_grounded, NULLIF(s.raw_ai_output,''),
             NULLIF(s.duplicate_of,''), NULLIF(s.duplicate_score, 0.0),
             NULLIF(s.duplicate_gate,''), s.should_add_alias, NULLIF(s.channel,''),
+            s.distinct_companies_found, NULLIF(s.alternative_companies, '[]'),
+            s.is_original_manufacturer, NULLIF(s.parent_company, ''),
             current_timestamp(), current_timestamp(), {verified_at_expr}
         )
     """)
@@ -773,23 +904,33 @@ try:
         circuit_breaker_skipped = 0
         total_candidates = len(candidates)
 
-        # Load vendor registry once (production silver table + previously verified names)
+        # Load first-class vs Manuf separately from medigator source of truth.
         print("  Loading vendor registry...")
-        prod_df = spark.sql(f"""
-            SELECT DISTINCT vendor AS vendor_name
-            FROM {SILVER_VENDORS_TABLE}
-            WHERE vendor IS NOT NULL AND TRIM(vendor) != ''
-        """)
+        from vendor_verifier_batch_pr import load_vendor_sources
+
+        (
+            source_first_class,
+            manuf_pairs,
+            ieee_manuf_identities,
+            oui_vendor_mappings,
+            first_class_enum_displays,
+        ) = load_vendor_sources(
+            lambda scope, key: dbutils.secrets.get(scope=scope, key=key)
+        )
         try:
             ver_df = spark.sql(f"""
                 SELECT DISTINCT official_name AS vendor_name
                 FROM {CANDIDATES_TABLE}
                 WHERE official_name IS NOT NULL AND TRIM(official_name) != ''
             """)
-            vendor_registry = [r.vendor_name for r in prod_df.union(ver_df).distinct().collect()]
+            vendor_registry = sorted(
+                set(source_first_class) | {r.vendor_name for r in ver_df.collect()}
+            )
         except Exception:
-            vendor_registry = [r.vendor_name for r in prod_df.collect()]
+            vendor_registry = source_first_class
         print(f"  Registry size: {len(vendor_registry)}")
+        print(f"  Manuf registry size: {len(manuf_pairs)}")
+        print(f"  IEEE Manuf registry size: {len(ieee_manuf_identities)}")
 
         for proc_idx, (_, row) in enumerate(candidates.iterrows()):
             if circuit_breaker_triggered:
@@ -806,6 +947,7 @@ try:
 
             # Per-vendor isolation: one bad write / network error must not abort the run
             try:
+                typed_manuf_matches = find_manuf_matches(vendor_name, manuf_pairs)
                 # ── Gate 1: raw name duplicate check ────────────────────────
                 similar_g1 = find_similar(vendor_name, vendor_registry)
                 gate1_dup = bool(similar_g1) and (
@@ -862,6 +1004,10 @@ try:
 
                 # ── Gate 2: normalized name duplicate check ──────────────────
                 official_name = clean_official_name(result_data.get("official_name", vendor_name))
+                official_manuf_matches = find_manuf_matches(official_name, manuf_pairs)
+                picked_manuf = pick_promote_manuf(
+                    typed_manuf_matches, official_manuf_matches, DUPLICATE_THRESHOLD
+                )
                 if official_name.lower() != vendor_name.lower():
                     similar_g2 = find_similar(official_name, vendor_registry)
                     gate2_dup = bool(similar_g2) and (
@@ -893,7 +1039,113 @@ try:
                         time.sleep(0.5)
                         continue
 
+                # ── P2: BRAND-OF / parent / acquirer → alias if parent in registry ──
+                parent_hit = resolve_parent_for_brand_of(
+                    verdict=result_data.get("verdict"),
+                    official_name=official_name,
+                    parent_company=result_data.get("parent_company"),
+                    acquired_by=result_data.get("acquired_by"),
+                    registry=vendor_registry,
+                    duplicate_threshold=DUPLICATE_THRESHOLD,
+                )
+                if parent_hit:
+                    match_name, match_score, match_type = parent_hit
+                    print(
+                        f"    P2 parent resolve ({match_type} {match_score:.0%}): "
+                        f"{official_name!r} → {match_name!r}"
+                    )
+                    print(
+                        f"    → should_add_alias: '{vendor_name}' as alias for '{match_name}'"
+                    )
+                    _upsert_candidate(
+                        vendor_name, cx_row, status="DUPLICATE",
+                        result=result_data, raw_ai_output=raw_response,
+                        search_grounded=search_grounded,
+                        official_name=official_name,
+                        duplicate_of=match_name, duplicate_score=match_score,
+                        duplicate_gate="p2-parent", should_add_alias=True,
+                    )
+                    results_summary.append({
+                        "vendor_name": vendor_name, "outcome": "DUPLICATE",
+                        "detail": f"P2 → '{official_name}' parent '{match_name}' ({match_type})",
+                        "orgs_count": row.get("orgs_count"),
+                    })
+                    duplicated += 1
+                    consecutive_failures = 0
+                    time.sleep(0.5)
+                    continue
+
                 enum_name = generate_enum_name(official_name)
+                if picked_manuf:
+                    manuf_enum, manuf_display, _ = picked_manuf
+                    manuf_source = "enum"
+                    manuf_ieee_short = ""
+                    pr_case = promote_pr_case(
+                        enum_name, official_name, manuf_enum, manuf_display
+                    )
+                    print(
+                        f"    → {pr_case}: Vendor.{manuf_enum} "
+                        f"({manuf_display!r}) → Vendor.{enum_name} ({official_name!r})"
+                    )
+                else:
+                    ieee_resolution = resolve_ieee_manuf(
+                        official_name,
+                        enum_name,
+                        official_name,
+                        ieee_manuf_identities,
+                        oui_vendor_mappings,
+                        first_class_enum_displays,
+                    )
+                    if ieee_resolution and ieee_resolution.pr_case == "alias":
+                        mapped_enum = ieee_resolution.alias_target_enum
+                        mapped_display = ieee_resolution.alias_target_display
+                        print(
+                            f"    IEEE identity already maps to Vendor.{mapped_enum}; "
+                            "routing as alias"
+                        )
+                        _upsert_candidate(
+                            vendor_name,
+                            cx_row,
+                            status="DUPLICATE",
+                            result=result_data,
+                            raw_ai_output=raw_response,
+                            search_grounded=search_grounded,
+                            official_name=official_name,
+                            duplicate_of=mapped_display,
+                            duplicate_score=1.0,
+                            duplicate_gate="ieee-existing",
+                            should_add_alias=True,
+                        )
+                        results_summary.append({
+                            "vendor_name": vendor_name,
+                            "outcome": "DUPLICATE",
+                            "detail": (
+                                f"IEEE identity → Vendor.{mapped_enum} "
+                                f"({mapped_display!r})"
+                            ),
+                            "orgs_count": row.get("orgs_count"),
+                        })
+                        duplicated += 1
+                        consecutive_failures = 0
+                        time.sleep(0.5)
+                        continue
+                    manuf_enum = ""
+                    if ieee_resolution:
+                        ieee_identity = ieee_resolution.identity
+                        manuf_display = ieee_identity.long_name
+                        manuf_source = "ieee"
+                        manuf_ieee_short = ieee_identity.short_name
+                        pr_case = ieee_resolution.pr_case
+                        print(
+                            f"    → {pr_case}: IEEE Manuf "
+                            f"{manuf_display!r} ({manuf_ieee_short}) "
+                            f"→ Vendor.{enum_name} ({official_name!r})"
+                        )
+                    else:
+                        manuf_display = ""
+                        manuf_source = ""
+                        manuf_ieee_short = ""
+                        pr_case = "new"
 
                 verdict = result_data.get("verdict", "SUSPICIOUS")
                 add_log_alias = (
@@ -914,6 +1166,11 @@ try:
                     result=result_data, raw_ai_output=raw_response,
                     search_grounded=search_grounded,
                     official_name=official_name, enum_name=enum_name,
+                    pr_case=pr_case,
+                    manuf_enum=manuf_enum,
+                    manuf_original_display=manuf_display,
+                    manuf_source=manuf_source,
+                    manuf_ieee_short=manuf_ieee_short,
                     duplicate_of=official_name if add_log_alias else "",
                     duplicate_gate="normalized" if add_log_alias else "",
                     should_add_alias=add_log_alias,
@@ -1084,6 +1341,7 @@ def _new_vendor_ticket(row, email: str, token: str) -> tuple[str, str]:
     note     = row.analyst_note or ""
     confidence = row.confidence_score or "?"
     orgs     = row.orgs_count or 0
+    pr_case  = row.pr_case or "new"
 
     lines = [
         f"Adding **{official}** to the medigator vendor registry.",
@@ -1105,6 +1363,17 @@ def _new_vendor_ticket(row, email: str, token: str) -> tuple[str, str]:
         f"- `medigator/common/domain_model/xiot/device.py` — add `{enum} = \"{official}\"` to `Vendor` enum",
         f"- `medigator/common/domain_model/intels/vulnerabilities/types.py` — add `{enum} = \"{official}\"` to `VulnerabilityRelevanceSource` and `manufacturer_sources`",
     ]
+    if row.manuf_source == "ieee":
+        lines.append(
+            "- `medigator/common/domain_model/oui_info.py` — map IEEE identities "
+            f"`{row.manuf_original_display}` and `{str(row.manuf_ieee_short or '').upper()}` "
+            f"to `Vendor.{enum}`"
+        )
+    elif pr_case == "promote_rename":
+        lines.append(
+            "- `medigator/common/domain_model/oui_info.py` — remap every reference "
+            f"from `Vendor.{row.manuf_enum}` to `Vendor.{enum}` (when present)"
+        )
     if row.should_add_alias and name.strip() != official.strip():
         lines += [
             "",
@@ -1114,10 +1383,13 @@ def _new_vendor_ticket(row, email: str, token: str) -> tuple[str, str]:
             f"- `medigator/common/domain_model/xiot/device.py` — add `\"{name}\"` to the "
             f"`VENDOR_ALIASES` entry for `Vendor.{enum}` (`\"{official}\"`)",
         ]
-    return _create_ticket(
-        f"[Vendor Verifier] Add new vendor: {official}",
-        lines, email, token,
-    )
+    if pr_case == "promote_rename":
+        summary = f"[Vendor Verifier] Promote and rename Manuf vendor: {official}"
+    elif pr_case == "promote":
+        summary = f"[Vendor Verifier] Promote Manuf vendor: {official}"
+    else:
+        summary = f"[Vendor Verifier] Add new vendor: {official}"
+    return _create_ticket(summary, lines, email, token)
 
 def _alias_ticket(row, email: str, token: str) -> tuple[str, str]:
     raw      = row.vendor_name_raw
@@ -1169,20 +1441,30 @@ else:
         else:
             print(
                 "  ⚠️  TICKETS_SCOPE=all_pending — will ticket the full backlog "
-                "(every LEGIT / alias row with no jira_ticket)."
+                "(every P1-eligible LEGIT / alias row with no jira_ticket)."
             )
 
+        conf_list = ", ".join(f"'{c}'" for c in sorted(AUTO_PR_CONFIDENCES))
         pending = spark.sql(f"""
             SELECT
                 vendor_name_raw, status, verdict, official_name, enum_name,
+                pr_case, manuf_enum, manuf_original_display,
+                manuf_source, manuf_ieee_short,
                 confidence_score, website, hardware_evidence, networking_proof,
                 supported_protocols, device_types, industries, analyst_note,
                 duplicate_of, duplicate_score, duplicate_gate, orgs_count, should_add_alias,
-                pipeline_run_id
+                pipeline_run_id, distinct_companies_found, is_original_manufacturer,
+                parent_company, alternative_companies
             FROM {CANDIDATES_TABLE}
             WHERE jira_ticket IS NULL
               AND (
-                   (status = 'COMPLETED' AND verdict = 'LEGIT')
+                   (
+                        status = 'COMPLETED'
+                    AND verdict = 'LEGIT'
+                    AND confidence_score IN ({conf_list})
+                    AND COALESCE(distinct_companies_found, 1) = 1
+                    AND (is_original_manufacturer IS NULL OR is_original_manufacturer = true)
+                   )
                 OR (status = 'DUPLICATE' AND should_add_alias = true)
               )
               {scope_filter}

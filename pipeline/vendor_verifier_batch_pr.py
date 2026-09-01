@@ -130,8 +130,31 @@ def _get_file(token: str, path: str) -> tuple[str, str]:
     )
     resp.raise_for_status()
     data = resp.json()
+    if data.get("encoding") != "base64":
+        raise ValueError(
+            f"{path} came back with encoding {data.get('encoding')!r} "
+            f"({data.get('size')} bytes); use _get_file_raw for files over 1MB"
+        )
     content = base64.b64decode(data["content"]).decode()
     return content, data["sha"]
+
+
+def _get_file_raw(token: str, path: str) -> str:
+    """Read a file too large for the base64 Contents response.
+
+    The Contents API only base64-encodes blobs up to 1MB and returns an empty
+    body with encoding "none" above that. `resources/manuf` is ~2.5MB.
+    """
+    headers = dict(_gh_headers(token))
+    headers["Accept"] = "application/vnd.github.raw"
+    resp = requests.get(
+        f"{GITHUB_API}/repos/{REPO}/contents/{path}",
+        headers=headers,
+        params={"ref": BASE_BRANCH},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.text
 
 
 def _push_file(
@@ -261,7 +284,10 @@ def _edit_oui_info_ieee_promote(
             lines.append(f"    {json.dumps(key, ensure_ascii=False)}: Vendor.{new_enum_name},")
     if not lines:
         return content, 0
-    close = content.rfind("\n}")
+    start = content.find("OUI_TO_VENDOR")
+    if start < 0:
+        raise ValueError("Could not find OUI_TO_VENDOR")
+    close = content.find("\n}", start)
     if close < 0:
         raise ValueError("Could not find end of OUI_TO_VENDOR")
     return content[:close] + "\n" + "\n".join(lines) + content[close:], len(lines)
@@ -323,12 +349,17 @@ def load_vendor_sources(
         device_content,
         re.MULTILINE,
     )
-    manuf_content, _ = _get_file(token, IEEE_MANUF_PATH)
+    manuf_content = _get_file_raw(token, IEEE_MANUF_PATH)
     oui_content, _ = _get_file(token, OUI_INFO_PY_PATH)
+    ieee_identities = parse_ieee_manuf_pairs(manuf_content)
+    if not ieee_identities:
+        # Failing closed keeps an unattended batch from silently downgrading
+        # every IEEE-backed promote to `new`.
+        raise ValueError(f"IEEE manuf registry parsed empty from {IEEE_MANUF_PATH}")
     return (
         first_class,
         manuf_pairs,
-        parse_ieee_manuf_pairs(manuf_content),
+        ieee_identities,
         parse_oui_vendor_mappings(oui_content),
         dict(first_class_pairs),
     )

@@ -1099,9 +1099,13 @@ try:
                     if ieee_resolution and ieee_resolution.pr_case == "alias":
                         mapped_enum = ieee_resolution.alias_target_enum
                         mapped_display = ieee_resolution.alias_target_display
+                        should_add_alias = gate2_should_add_alias(
+                            result_data.get("verdict")
+                        )
                         print(
                             f"    IEEE identity already maps to Vendor.{mapped_enum}; "
-                            "routing as alias"
+                            f"routing as alias (should_add_alias={should_add_alias}, "
+                            f"verdict={result_data.get('verdict')})"
                         )
                         _upsert_candidate(
                             vendor_name,
@@ -1114,7 +1118,7 @@ try:
                             duplicate_of=mapped_display,
                             duplicate_score=1.0,
                             duplicate_gate="ieee-existing",
-                            should_add_alias=True,
+                            should_add_alias=should_add_alias,
                         )
                         results_summary.append({
                             "vendor_name": vendor_name,

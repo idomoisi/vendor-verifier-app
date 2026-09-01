@@ -21,6 +21,10 @@ class IeeeManufResolution:
     pr_case: str
     alias_target_enum: str | None = None
     alias_target_display: str | None = None
+    # Populated with (oui_key, current Vendor enum) when the identity's keys
+    # cannot be resolved: several targets, or one that is not first-class.
+    # The case stays `new`, but the conflict has to be visible in the run log.
+    oui_conflicts: tuple[tuple[str, str], ...] = ()
 
 
 def parse_ieee_manuf_pairs(content: str) -> list[IeeeManufIdentity]:
@@ -79,16 +83,24 @@ def find_exact_ieee_manuf(
     return next(iter(matches)) if len(matches) == 1 else None
 
 
+def ieee_mapping_entries(
+    identity: IeeeManufIdentity,
+    mappings: dict[str, str],
+) -> dict[str, str]:
+    """Return existing oui_info keys for this identity mapped to their Vendor."""
+    keys = (
+        identity.long_name,
+        identity.short_name,
+        identity.short_name.upper(),
+    )
+    return {key: mappings[key] for key in dict.fromkeys(keys) if key in mappings}
+
+
 def ieee_mapping_targets(
     identity: IeeeManufIdentity,
     mappings: dict[str, str],
 ) -> set[str]:
-    keys = {
-        identity.long_name,
-        identity.short_name,
-        identity.short_name.upper(),
-    }
-    return {mappings[key] for key in keys if key in mappings}
+    return set(ieee_mapping_entries(identity, mappings).values())
 
 
 def ieee_promote_pr_case(
@@ -114,7 +126,8 @@ def resolve_ieee_manuf(
     identity = find_exact_ieee_manuf(official_name, identities)
     if identity is None:
         return None
-    targets = ieee_mapping_targets(identity, mappings)
+    entries = ieee_mapping_entries(identity, mappings)
+    targets = set(entries.values())
     if len(targets) == 1:
         target_enum = next(iter(targets))
         target_display = enum_displays.get(target_enum)
@@ -125,9 +138,14 @@ def resolve_ieee_manuf(
                 alias_target_enum=target_enum,
                 alias_target_display=target_display,
             )
-        return None
     if targets:
-        return None
+        # Several targets, or a single one that is not a first-class Vendor.
+        # Promoting would fight the existing keys, so stay `new` and report.
+        return IeeeManufResolution(
+            identity,
+            "new",
+            oui_conflicts=tuple(sorted(entries.items())),
+        )
     return IeeeManufResolution(
         identity,
         ieee_promote_pr_case(enum_name, display_name, identity),

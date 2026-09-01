@@ -1134,7 +1134,21 @@ try:
                         time.sleep(0.5)
                         continue
                     manuf_enum = ""
-                    if ieee_resolution:
+                    if ieee_resolution and ieee_resolution.oui_conflicts:
+                        # Keys already claimed by several vendors, or by one
+                        # that is not first-class. Ship `new` without touching
+                        # oui_info, but make the conflict visible in the run.
+                        manuf_display = ""
+                        manuf_source = ""
+                        manuf_ieee_short = ""
+                        pr_case = "new"
+                        print(
+                            f"    ⚠️  IEEE identity "
+                            f"{ieee_resolution.identity.long_name!r} has unusable "
+                            f"oui_info keys {ieee_resolution.oui_conflicts}; "
+                            f"staying `new` without attaching the OUI"
+                        )
+                    elif ieee_resolution:
                         ieee_identity = ieee_resolution.identity
                         manuf_display = ieee_identity.long_name
                         manuf_source = "ieee"

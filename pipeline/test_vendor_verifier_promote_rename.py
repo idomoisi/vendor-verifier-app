@@ -230,3 +230,40 @@ def test_existing_ieee_mapping_resolves_as_alias():
     assert resolution is not None
     assert resolution.pr_case == "alias"
     assert resolution.alias_target_enum == "Existing"
+
+
+def test_ambiguous_ieee_oui_targets_report_conflict_instead_of_promoting():
+    identity = IeeeManufIdentity("maschinenfab", "Maschinenfabrik Reinhausen GmbH")
+
+    resolution = resolve_ieee_manuf(
+        "Maschinenfabrik Reinhausen",
+        "Reinhausen",
+        "Reinhausen",
+        [identity],
+        {identity.long_name: "AlphaVendor", "MASCHINENFAB": "BetaVendor"},
+        {"AlphaVendor": "Alpha Vendor", "BetaVendor": "Beta Vendor"},
+    )
+
+    assert resolution is not None
+    assert resolution.pr_case == "new"
+    assert resolution.oui_conflicts == (
+        ("MASCHINENFAB", "BetaVendor"),
+        (identity.long_name, "AlphaVendor"),
+    )
+
+
+def test_non_first_class_ieee_target_reports_conflict_instead_of_promoting():
+    identity = IeeeManufIdentity("maschinenfab", "Maschinenfabrik Reinhausen GmbH")
+
+    resolution = resolve_ieee_manuf(
+        "Maschinenfabrik Reinhausen",
+        "Reinhausen",
+        "Reinhausen",
+        [identity],
+        {identity.long_name: "SomeManufEnum"},
+        {},
+    )
+
+    assert resolution is not None
+    assert resolution.pr_case == "new"
+    assert resolution.oui_conflicts == ((identity.long_name, "SomeManufEnum"),)

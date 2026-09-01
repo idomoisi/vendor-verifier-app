@@ -413,10 +413,9 @@ def apply_batch_edits(
                     device_content = _edit_device_py_promote(
                         device_content, row.manuf_enum, enum_name, official
                     )
-                if (
-                    row.pr_case == "promote_rename"
-                    and row.manuf_original_display != official
-                ):
+                # An IEEE long name can differ from the new display even in a
+                # plain promote, because the case is decided on cleaned names.
+                if row.manuf_original_display != official:
                     device_content = _edit_device_py_alias(
                         device_content, enum_name, row.manuf_original_display
                     )

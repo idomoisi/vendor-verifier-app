@@ -171,6 +171,32 @@ def test_batch_ieee_promote_rename_inserts_oui_keys_without_deleting_manuf_row()
     assert '"MASCHINENFAB": Vendor.Reinhausen' in oui
 
 
+def test_batch_ieee_promote_aliases_long_name_even_without_rename():
+    """The case is decided on cleaned names, the alias on the raw long name.
+
+    "Example GmbH" cleans to "Example", so this is a plain promote, but the
+    batch must still alias the long name or Vendor("Example GmbH") breaks.
+    """
+    row = _row(
+        vendor_name_raw="Example",
+        official_name="Example",
+        enum_name="Example",
+        pr_case="promote",
+        manuf_enum=None,
+        manuf_original_display="Example GmbH",
+        manuf_source="ieee",
+        manuf_ieee_short="example",
+    )
+
+    device, _types, oui, applied = apply_batch_edits(
+        DEVICE_PY, TYPES_PY, "OUI_TO_VENDOR = {\n}\n", [row]
+    )
+
+    assert applied == [row]
+    assert '"Example GmbH"' in device
+    assert '"EXAMPLE": Vendor.Example' in oui
+
+
 def test_ieee_insert_rejects_mapping_collision():
     try:
         _edit_oui_info_ieee_promote(

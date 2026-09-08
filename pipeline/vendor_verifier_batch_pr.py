@@ -1,6 +1,10 @@
 """Batch GitHub PR creation for the Coralogix vendor pipeline.
 
 Mirrors vendor-verifier-app/github_pr.py but applies many vendors/aliases in one branch.
+
+Batch-only policy: the pipeline never opens a PR for a single vendor. A batch needs at
+least ``MIN_BATCH_SIZE`` rows (>= 2); smaller batches stay pending for a later run.
+Single-vendor PRs remain the interactive Device Labeler path only.
 """
 
 from __future__ import annotations
@@ -26,6 +30,10 @@ BASE_BRANCH = "staging"
 DEVICE_PY_PATH = "medigator/common/domain_model/xiot/device.py"
 TYPES_PY_PATH = "medigator/common/domain_model/intels/vulnerabilities/types.py"
 SECRET_SCOPE = "vendor-validation-app"
+
+# Smallest batch the pipeline is allowed to open a PR for. A batch of one is a
+# single-vendor PR, which this pipeline must never produce.
+MIN_BATCH_SIZE = 2
 
 
 @dataclass(frozen=True)
@@ -210,11 +218,25 @@ def resolve_vendor_enum_key(device_py: str, canonical_display: str) -> str | Non
     return match.group(1) if match else None
 
 
+def _distinct_tickets(rows: list[BatchPrRow]) -> list[str]:
+    """Batch tickets in row order, de-duplicated (all rows of one run share a ticket)."""
+    seen: list[str] = []
+    for row in rows:
+        if row.jira_ticket and row.jira_ticket not in seen:
+            seen.append(row.jira_ticket)
+    return seen
+
+
 def _build_batch_pr_body(rows: list[BatchPrRow], pr_mode: str, run_id: str) -> str:
+    tickets = _distinct_tickets(rows)
+    ticket_links = ", ".join(
+        f"[{key}](https://team82.atlassian.net/browse/{key})" for key in tickets
+    )
     lines = [
         f"## Vendor Verifier batch PR (`{pr_mode}`)",
         "",
         f"**Run ID:** `{run_id}`",
+        f"**Batch ticket(s):** {ticket_links or 'N/A'}",
         f"**Changes:** {len(rows)} vendor lead(s)",
         "",
         "| Jira | Case | Raw log string | Official / target |",
@@ -271,16 +293,29 @@ def create_batch_pr(
     run_id: str,
     get_secret: Callable[[str, str], str],
     link_jira: bool = True,
+    min_batch_size: int = MIN_BATCH_SIZE,
 ) -> str | None:
     if not rows:
         return None
+    if min_batch_size < MIN_BATCH_SIZE:
+        raise ValueError(
+            f"min_batch_size={min_batch_size} is below the batch-only floor {MIN_BATCH_SIZE}"
+        )
+    if len(rows) < min_batch_size:
+        raise ValueError(
+            f"Refusing to open a PR for {len(rows)} row(s): the pipeline is batch-only "
+            f"(min_batch_size={min_batch_size}). Single-vendor PRs go through Device Labeler."
+        )
 
     token, auth_mode = _resolve_github_auth(get_secret)
     if not token:
         raise RuntimeError("GitHub auth failed — no token available")
 
     date_suffix = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
-    lead_ticket = rows[0].jira_ticket
+    tickets = _distinct_tickets(rows)
+    if not tickets:
+        raise ValueError("Batch rows carry no Jira ticket — run CREATE_TICKETS first")
+    lead_ticket = tickets[0]
     branch_name = f"{lead_ticket}-wip/vendor-verifier/batch-{date_suffix}"
     commit_message = f"{lead_ticket}: [Vendor Verifier] Batch {pr_mode} — {len(rows)} changes"
     pr_title = f"{lead_ticket}: [Vendor Verifier] Batch PR ({pr_mode}) — {len(rows)} changes"
@@ -308,11 +343,11 @@ def create_batch_pr(
         email = get_secret(SECRET_SCOPE, "jira_email")
         jira_token = get_secret(SECRET_SCOPE, "jira_api_token")
         if email and jira_token:
-            for row in rows:
+            for ticket in tickets:
                 try:
-                    link_pr_to_jira(row.jira_ticket, pr_url, email=email, token=jira_token)
+                    link_pr_to_jira(ticket, pr_url, email=email, token=jira_token)
                 except Exception:
-                    logger.exception("Failed linking PR to %s", row.jira_ticket)
+                    logger.exception("Failed linking PR to %s", ticket)
 
     return pr_url
 
@@ -329,8 +364,13 @@ def create_batch_pr_from_spark(
     *,
     auto_pr_confidences: set[str],
     get_secret: Callable[[str, str], str],
+    min_batch_size: int = MIN_BATCH_SIZE,
 ) -> str | None:
-    """Query qualifying Delta rows, open one batch PR, write pr_url + pr_batch_id."""
+    """Query qualifying Delta rows, open one batch PR, write pr_url + pr_batch_id.
+
+    Returns None when fewer than ``min_batch_size`` rows qualify — those rows keep an
+    empty ``pr_url`` and roll into the next run's batch.
+    """
     conf_list = ", ".join(f"'{c}'" for c in sorted(auto_pr_confidences))
     pending = spark.sql(
         f"""
@@ -343,7 +383,9 @@ def create_batch_pr_from_spark(
           AND (pr_url IS NULL OR TRIM(pr_url) = '')
           AND (
                 (status = 'COMPLETED' AND verdict = 'LEGIT'
-                 AND confidence_score IN ({conf_list}))
+                 AND confidence_score IN ({conf_list})
+                 AND COALESCE(distinct_companies_found, 1) = 1
+                 AND (is_original_manufacturer IS NULL OR is_original_manufacturer = true))
              OR (status = 'DUPLICATE' AND should_add_alias = true)
           )
         ORDER BY orgs_count DESC NULLS LAST, vendor_name_raw
@@ -352,6 +394,13 @@ def create_batch_pr_from_spark(
 
     if not pending:
         print("  No rows qualify for batch PR.")
+        return None
+
+    if len(pending) < min_batch_size:
+        print(
+            f"  Held back: {len(pending)} row(s) qualify but the pipeline is batch-only "
+            f"(min_batch_size={min_batch_size}). They stay pending for the next run."
+        )
         return None
 
     rows = [
@@ -372,7 +421,13 @@ def create_batch_pr_from_spark(
         for r in pending
     ]
     print(f"  Opening batch PR for {len(rows)} row(s)...")
-    pr_url = create_batch_pr(rows, pr_mode=pr_mode, run_id=run_id, get_secret=get_secret)
+    pr_url = create_batch_pr(
+        rows,
+        pr_mode=pr_mode,
+        run_id=run_id,
+        get_secret=get_secret,
+        min_batch_size=min_batch_size,
+    )
     if not pr_url:
         return None
 

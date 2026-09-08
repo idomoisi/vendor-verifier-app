@@ -17,8 +17,14 @@
 # MAGIC 3. `FILTER` — skip COMPLETED / DUPLICATE / **FAILED**; apply orgs_count + cost cap
 # MAGIC 4. `VERIFY` — Gemini Pro + duplicate gates per vendor (retry + rate limiting)
 # MAGIC 5. `REPORT` — summary display + run log
-# MAGIC 6. `CREATE_TICKETS` — Jira NET tickets (new vendor + alias)
+# MAGIC 6. `CREATE_TICKETS` — **one** batch Jira NET ticket for the whole run
 # MAGIC 7. `CREATE_PR` — optional batched GitHub PR (`CREATE_PR=True`)
+# MAGIC
+# MAGIC **Batch-only:** this pipeline never creates a per-vendor NET ticket or a single-vendor
+# MAGIC PR. Each run produces at most one batch ticket and one batch PR, and only when at
+# MAGIC least `MIN_BATCH_SIZE` (>= 2) vendors qualify — otherwise the rows stay pending and
+# MAGIC roll into the next run. Single-vendor tickets/PRs belong to the interactive
+# MAGIC Device Labeler Vendor Verifier tab.
 # MAGIC
 # MAGIC **Execution plan:** `pipeline/README.md` in `idomoisi/vendor-verifier-app`
 # MAGIC (repo SoT). Local medigator `notebooks/databricks/` copies are not the commit target.
@@ -66,7 +72,7 @@ if _PIPELINE_LIB not in sys.path:
     sys.path.insert(0, _PIPELINE_LIB)
 
 # ── Run mode ──────────────────────────────────────────────────────────────────
-# mega_backfill: unlimited VERIFY for one-time backfill (CREATE_PR manual after review)
+# mega_backfill: capped VERIFY for one-time / follow-up mega batches (CREATE_PR manual after review)
 # weekly:        scheduled job — VERIFY cap 50, CREATE_PR automatic
 dbutils.widgets.text("RUN_MODE", "mega_backfill")
 RUN_MODE = dbutils.widgets.get("RUN_MODE")
@@ -76,6 +82,13 @@ PR_MODE = "mega"             # "mega" | "weekly" (used when CREATE_PR=True)
 # Weekly mode turns this on. Scope defaults to this run only (prevents backlog floods).
 CREATE_TICKETS = False
 TICKETS_SCOPE = "current_run"  # "current_run" | "all_pending" (all_pending = full backlog)
+
+# ── Batch-only policy ─────────────────────────────────────────────────────────
+# This pipeline creates ONE batch NET ticket and ONE batch PR per run — never a
+# per-vendor ticket or PR. A run with fewer qualifying vendors than MIN_BATCH_SIZE
+# creates nothing; the rows stay pending and roll into the next run's batch.
+# Single-vendor tickets/PRs are the interactive Device Labeler path only.
+MIN_BATCH_SIZE = 2  # hard floor is 2 — a batch of one is a single-vendor PR
 
 # ── Time window ───────────────────────────────────────────────────────────────
 DAYS_AGO = 90
@@ -87,7 +100,9 @@ MIN_ORGS_COUNT = 1        # Only process vendors seen in at least N orgs
 FORCE_REVERIFY = False    # True = re-verify even if already COMPLETED / DUPLICATE / FAILED
 
 if RUN_MODE == "mega_backfill":
-    MAX_VENDORS_PER_RUN = 0
+    # Second mega (Aug 2026): top 80 by orgs/events after skipping COMPLETED/DUPLICATE/FAILED.
+    # Set 0 only if you intentionally want unlimited VERIFY.
+    MAX_VENDORS_PER_RUN = 80
 elif RUN_MODE == "weekly":
     MAX_VENDORS_PER_RUN = 50
     CREATE_TICKETS = True
@@ -98,6 +113,12 @@ else:
 
 SKIP_STATUSES = () if FORCE_REVERIFY else ("COMPLETED", "DUPLICATE", "FAILED")
 AUTO_PR_CONFIDENCES = {"HIGH", "MEDIUM"}
+
+if MIN_BATCH_SIZE < 2:
+    raise ValueError(
+        f"MIN_BATCH_SIZE={MIN_BATCH_SIZE} is not allowed — the Coralogix pipeline is "
+        "batch-only and must never create a single-vendor ticket or PR."
+    )
 
 # ── Duplicate gate thresholds ─────────────────────────────────────────────────
 SIMILARITY_THRESHOLD = 0.70   # Minimum score to surface as "similar" in logs
@@ -134,12 +155,16 @@ print("Configuration loaded.")
 # MAGIC | Goal | Action |
 # MAGIC |---|---|
 # MAGIC | Mega / resume VERIFY only | `CREATE_TICKETS=False`, `CREATE_PR=False`, **Run All** |
-# MAGIC | Tickets for this run only | `CREATE_TICKETS=True`, `TICKETS_SCOPE=current_run` |
-# MAGIC | Tickets for full backlog | `CREATE_TICKETS=True`, `TICKETS_SCOPE=all_pending` (explicit) |
+# MAGIC | Batch ticket for this run only | `CREATE_TICKETS=True`, `TICKETS_SCOPE=current_run` |
+# MAGIC | Batch ticket for full backlog | `CREATE_TICKETS=True`, `TICKETS_SCOPE=all_pending` (explicit) |
 # MAGIC | Mega batch PR (after SQL review) | `CREATE_PR=True`, `PR_MODE=mega`, **Run All** |
 # MAGIC | Weekly scheduled run | `RUN_MODE=weekly` (auto tickets + PR, current_run scope) |
 # MAGIC | Resume after failure | **Run All** — skips COMPLETED/DUPLICATE/FAILED |
 # MAGIC | Reprocess including FAILED | `FORCE_REVERIFY=True` |
+# MAGIC
+# MAGIC **Batch-only:** one batch ticket + one batch PR per run, and only when at least
+# MAGIC `MIN_BATCH_SIZE` (>= 2) vendors qualify. `MIN_BATCH_SIZE=1` raises — use the
+# MAGIC Device Labeler Vendor Verifier tab for a one-off single vendor.
 # MAGIC
 # MAGIC Full runbook: `notebooks/databricks/VENDOR_VERIFIER_EXECUTION_PLAN.md`
 # MAGIC
@@ -183,7 +208,7 @@ spark.sql(f"""
         pipeline_run_id     STRING,               -- run_id that last touched this row
 
         -- Gemini verification output
-        verdict             STRING,               -- LEGIT | SOFTWARE-ONLY | SUSPICIOUS
+        verdict             STRING,               -- LEGIT | NOT-MANUFACTURER | BRAND-OF | AMBIGUOUS | GENERIC | SOFTWARE-ONLY | SUSPICIOUS
         official_name       STRING,               -- AI-corrected canonical name
         enum_name           STRING,               -- PascalCase enum value for device.py
         confidence_score    STRING,               -- HIGH | MEDIUM | LOW
@@ -198,6 +223,11 @@ spark.sql(f"""
         technical_artifacts STRING,               -- JSON array of URLs
         search_grounded     BOOLEAN,
         raw_ai_output       STRING,               -- full Gemini response (truncated to 8 KB)
+        -- P1 taxonomy fields
+        distinct_companies_found INT,             -- how many distinct companies Gemini found
+        alternative_companies STRING,             -- JSON list of {{name, website?}} for AMBIGUOUS
+        is_original_manufacturer BOOLEAN,         -- False for distributors / integrators / assemblers
+        parent_company      STRING,               -- set when BRAND-OF
 
         -- Alias routing (DUPLICATE gates + LEGIT name normalization)
         duplicate_of        STRING,               -- canonical vendor: existing match OR new official_name
@@ -230,6 +260,10 @@ for _col, _type in (
     ("jira_ticket", "STRING"),
     ("pr_url", "STRING"),
     ("pr_batch_id", "STRING"),
+    ("distinct_companies_found", "INT"),
+    ("alternative_companies", "STRING"),
+    ("is_original_manufacturer", "BOOLEAN"),
+    ("parent_company", "STRING"),
 ):
     if _col not in _existing_cols:
         spark.sql(f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN {_col} {_type}")
@@ -533,6 +567,7 @@ from vendor_verifier_normalization import generate_enum_name, clean_official_nam
 from vendor_verifier_similarity import (
     find_similar as _find_similar_impl,
     gate2_should_add_alias,
+    resolve_parent_for_brand_of,
 )
 
 
@@ -558,35 +593,59 @@ def find_similar(input_name: str, registry: list,
 
 # ── Gemini prompt + helpers ───────────────────────────────────────────────────
 VERIFICATION_PROMPT = """### Role
-You are a Technical Asset Discovery Specialist. Verify if this vendor manufactures physical, network-connected OT or Medical hardware.
+You are a Technical Asset Discovery Specialist. Classify unknown vendor strings from OT/IoMT asset discovery logs.
 
-**Vendor:** {vendor_name}
-**Website:** {vendor_url}
+**Vendor string from log:** {vendor_name}
+**Website hint:** {vendor_url}
 
-Use Google Search. Look for: physical datasheets (dimensions, weight, power specs), network stack evidence, OT/IoMT protocols, IEEE OUI registration, firmware portals.
+Use Google Search. Decide whether this string maps to exactly one original hardware manufacturer, several companies (homonym), a non-manufacturer brand, or a generic/non-company token.
+
+Look for: physical datasheets (dimensions, weight, power specs), network stack evidence, OT/IoMT protocols, IEEE OUI registration, firmware portals, parent/owner relationships, and whether multiple unrelated companies share the same name.
 
 Respond ONLY with valid JSON:
 {{
-    "verdict": "LEGIT or SOFTWARE-ONLY or SUSPICIOUS",
-    "official_name": "Official company name with correct capitalisation",
-    "website": "Official URL",
-    "hardware_evidence": "2-3 physical products with specific specs",
-    "networking_proof": "Network communication evidence",
-    "supported_protocols": ["list", "of", "protocols"],
+    "verdict": "LEGIT or NOT-MANUFACTURER or BRAND-OF or AMBIGUOUS or GENERIC or SOFTWARE-ONLY or SUSPICIOUS",
+    "official_name": "Best single official name if one exists, else empty",
+    "website": "Official URL or empty",
+    "is_original_manufacturer": true,
+    "parent_company": "Parent/owner if BRAND-OF, else null",
+    "acquired_by": "Acquirer if known, else null",
+    "distinct_companies_found": 1,
+    "alternative_companies": [{{"name": "Company A", "website": "https://..."}}],
+    "hardware_evidence": "2-3 physical products with specific specs, or n/a",
+    "networking_proof": "Network communication evidence or n/a",
+    "supported_protocols": ["list"],
     "mac_oui_check": "Yes/No/Unknown",
-    "technical_artifacts": ["URLs to datasheets/manuals"],
-    "analyst_note": "OEM/white-label observations",
-    "device_types": ["device types manufactured"],
+    "technical_artifacts": ["URLs"],
+    "analyst_note": "Why this verdict; list collisions explicitly for AMBIGUOUS",
+    "device_types": ["types"],
     "industries": ["Healthcare", "Industrial", "Enterprise"],
     "confidence_score": "HIGH/MEDIUM/LOW"
-}}"""
+}}
+
+Rules:
+- If the string matches ≥2 distinct real companies → verdict AMBIGUOUS, distinct_companies_found ≥ 2, fill alternative_companies. Do NOT pick one arbitrarily.
+- If distributor / reseller / integrator / retailer / assembler / system builder (not original manufacturer) → NOT-MANUFACTURER and is_original_manufacturer=false.
+- If brand/subsidiary/white-label of another company → BRAND-OF and set parent_company (use the owning/parent company name).
+- If the brand is widely rebranded / multi-affiliated Chinese industrial PC OEM (e.g. also sold as Iwill / Xin Secco / Yanqin / Ennoconn group brands) and you cannot name one unambiguous first-party manufacturer → AMBIGUOUS or BRAND-OF, never LEGIT.
+- If product category, acronym, model number, OCR garbage, BIOS OEMID remnant, or control-character remnant → GENERIC (do NOT invent the most plausible company).
+- SOFTWARE-ONLY for OS/cloud/firmware/software brands with no network-connected hardware OEM story.
+- LEGIT only when original manufacturer of network-connected OT/IoMT/enterprise hardware AND distinct_companies_found == 1 AND is_original_manufacturer=true AND no parent/owner brand relationship.
+"""
 
 REQUIRED_FIELDS = {
     "verdict", "official_name", "website", "hardware_evidence",
     "networking_proof", "supported_protocols", "mac_oui_check",
     "technical_artifacts", "analyst_note", "device_types", "industries",
 }
-VALID_VERDICTS = {"LEGIT", "SOFTWARE-ONLY", "SUSPICIOUS"}
+VALID_VERDICTS = {
+    "LEGIT", "NOT-MANUFACTURER", "BRAND-OF", "AMBIGUOUS", "GENERIC",
+    "SOFTWARE-ONLY", "SUSPICIOUS",
+}
+NON_PR_VERDICTS = {
+    "NOT-MANUFACTURER", "BRAND-OF", "AMBIGUOUS", "GENERIC",
+    "SOFTWARE-ONLY", "SUSPICIOUS",
+}
 
 def _extract_json(text: str) -> dict | None:
     if not text:
@@ -614,6 +673,25 @@ def _validate(data: dict) -> tuple:
     if v and v not in VALID_VERDICTS:
         errors.append(f"Bad verdict: {v!r}")
     return len(errors) == 0, errors
+
+
+def is_new_vendor_auto_pr_eligible(result: dict | None, *, confidence: str | None = None) -> bool:
+    """P1 gate: LEGIT + original manufacturer + unique company + confidence band."""
+    d = result or {}
+    verdict = (d.get("verdict") or "").strip()
+    if verdict != "LEGIT":
+        return False
+    conf = (confidence if confidence is not None else d.get("confidence_score") or "").strip().upper()
+    if conf not in AUTO_PR_CONFIDENCES:
+        return False
+    if d.get("is_original_manufacturer") is False:
+        return False
+    distinct = d.get("distinct_companies_found")
+    if isinstance(distinct, int) and distinct != 1:
+        return False
+    if isinstance(distinct, str) and distinct.strip().isdigit() and int(distinct.strip()) != 1:
+        return False
+    return True
 
 def gemini_verify(vendor_name: str, gemini_key: str) -> tuple:
     from google import genai
@@ -666,6 +744,34 @@ def _upsert_candidate(vendor_name_raw: str, cx_row: dict, *,
 
     verified_at_expr = "current_timestamp()" if status == "COMPLETED" else "NULL"
 
+    distinct_raw = d.get("distinct_companies_found")
+    if isinstance(distinct_raw, bool):
+        distinct_sql = "NULL"
+    elif isinstance(distinct_raw, int):
+        distinct_sql = str(int(distinct_raw))
+    elif isinstance(distinct_raw, str) and distinct_raw.strip().lstrip("-").isdigit():
+        distinct_sql = str(int(distinct_raw.strip()))
+    else:
+        distinct_sql = "NULL"
+
+    alts = d.get("alternative_companies")
+    if isinstance(alts, str):
+        alts_json = alts
+    else:
+        alts_json = json.dumps(alts or [])
+
+    oem = d.get("is_original_manufacturer")
+    if isinstance(oem, bool):
+        oem_sql = str(oem).lower()
+    else:
+        oem_sql = "NULL"
+
+    parent = d.get("parent_company")
+    if parent in (None, "null", "None"):
+        parent_sql = ""
+    else:
+        parent_sql = str(parent)
+
     spark.sql(f"""
         MERGE INTO {CANDIDATES_TABLE} AS t
         USING (SELECT
@@ -696,7 +802,11 @@ def _upsert_candidate(vendor_name_raw: str, cx_row: dict, *,
             {float(duplicate_score)}                                AS duplicate_score,
             '{_esc(duplicate_gate)}'                                AS duplicate_gate,
             {str(should_add_alias).lower()}                         AS should_add_alias,
-            '{_esc(str(cx_row.get("channel") or ""))}'              AS channel
+            '{_esc(str(cx_row.get("channel") or ""))}'              AS channel,
+            {distinct_sql}                                          AS distinct_companies_found,
+            '{_esc(alts_json)}'                                     AS alternative_companies,
+            {oem_sql}                                               AS is_original_manufacturer,
+            '{_esc(parent_sql)}'                                    AS parent_company
         ) AS s ON t.vendor_name_raw = s.vendor_name_raw
         WHEN MATCHED THEN UPDATE SET
             t.orgs_count        = s.orgs_count,
@@ -726,6 +836,10 @@ def _upsert_candidate(vendor_name_raw: str, cx_row: dict, *,
             t.duplicate_gate    = NULLIF(s.duplicate_gate, ''),
             t.should_add_alias  = s.should_add_alias,
             t.channel           = NULLIF(s.channel, ''),
+            t.distinct_companies_found = s.distinct_companies_found,
+            t.alternative_companies = NULLIF(s.alternative_companies, '[]'),
+            t.is_original_manufacturer = s.is_original_manufacturer,
+            t.parent_company    = NULLIF(s.parent_company, ''),
             t.last_seen         = current_timestamp(),
             t.verified_at       = {verified_at_expr}
         WHEN NOT MATCHED THEN INSERT (
@@ -736,6 +850,8 @@ def _upsert_candidate(vendor_name_raw: str, cx_row: dict, *,
             mac_oui_check, device_types, industries, analyst_note,
             technical_artifacts, search_grounded, raw_ai_output,
             duplicate_of, duplicate_score, duplicate_gate, should_add_alias, channel,
+            distinct_companies_found, alternative_companies,
+            is_original_manufacturer, parent_company,
             first_seen, last_seen, verified_at
         ) VALUES (
             s.vendor_name_raw, s.orgs_count, s.events, s.orgs, s.message_examples,
@@ -749,15 +865,21 @@ def _upsert_candidate(vendor_name_raw: str, cx_row: dict, *,
             s.search_grounded, NULLIF(s.raw_ai_output,''),
             NULLIF(s.duplicate_of,''), NULLIF(s.duplicate_score, 0.0),
             NULLIF(s.duplicate_gate,''), s.should_add_alias, NULLIF(s.channel,''),
+            s.distinct_companies_found, NULLIF(s.alternative_companies, '[]'),
+            s.is_original_manufacturer, NULLIF(s.parent_company, ''),
             current_timestamp(), current_timestamp(), {verified_at_expr}
         )
     """)
 
-def _set_jira_ticket(vendor_name_raw: str, ticket_key: str) -> None:
+def _set_batch_jira_ticket(vendor_names: list[str], ticket_key: str) -> None:
+    """Stamp the run's single batch ticket onto every row it covers."""
+    if not vendor_names:
+        return
+    name_list = ", ".join(f"'{_esc(name)}'" for name in vendor_names)
     spark.sql(f"""
         UPDATE {CANDIDATES_TABLE}
         SET jira_ticket = '{_esc(ticket_key)}', last_seen = current_timestamp()
-        WHERE vendor_name_raw = '{_esc(vendor_name_raw)}'
+        WHERE vendor_name_raw IN ({name_list})
     """)
 
 # ── Main verification loop ────────────────────────────────────────────────────
@@ -893,6 +1015,42 @@ try:
                         time.sleep(0.5)
                         continue
 
+                # ── P2: BRAND-OF / parent / acquirer → alias if parent in registry ──
+                parent_hit = resolve_parent_for_brand_of(
+                    verdict=result_data.get("verdict"),
+                    official_name=official_name,
+                    parent_company=result_data.get("parent_company"),
+                    acquired_by=result_data.get("acquired_by"),
+                    registry=vendor_registry,
+                    duplicate_threshold=DUPLICATE_THRESHOLD,
+                )
+                if parent_hit:
+                    match_name, match_score, match_type = parent_hit
+                    print(
+                        f"    P2 parent resolve ({match_type} {match_score:.0%}): "
+                        f"{official_name!r} → {match_name!r}"
+                    )
+                    print(
+                        f"    → should_add_alias: '{vendor_name}' as alias for '{match_name}'"
+                    )
+                    _upsert_candidate(
+                        vendor_name, cx_row, status="DUPLICATE",
+                        result=result_data, raw_ai_output=raw_response,
+                        search_grounded=search_grounded,
+                        official_name=official_name,
+                        duplicate_of=match_name, duplicate_score=match_score,
+                        duplicate_gate="p2-parent", should_add_alias=True,
+                    )
+                    results_summary.append({
+                        "vendor_name": vendor_name, "outcome": "DUPLICATE",
+                        "detail": f"P2 → '{official_name}' parent '{match_name}' ({match_type})",
+                        "orgs_count": row.get("orgs_count"),
+                    })
+                    duplicated += 1
+                    consecutive_failures = 0
+                    time.sleep(0.5)
+                    continue
+
                 enum_name = generate_enum_name(official_name)
 
                 verdict = result_data.get("verdict", "SUSPICIOUS")
@@ -990,18 +1148,22 @@ except Exception as exc:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Stage 5 — Create Jira tickets
+# MAGIC ## Stage 5 — Create the batch Jira ticket
 # MAGIC
-# MAGIC Creates NET tickets for:
-# MAGIC - **LEGIT** vendors — "Add new vendor: {official_name}" with code changes to make
-# MAGIC - **LEGIT + normalized name** — same ticket also requests adding `{vendor_name_raw}` as
-# MAGIC   a `VENDOR_ALIASES` entry so the exact Coralogix log string stops reappearing
-# MAGIC - **Duplicate alias candidates** — "Add alias: {vendor_name_raw} → {duplicate_of}"
+# MAGIC Creates **exactly one** NET ticket per run, covering every qualifying row:
+# MAGIC - **LEGIT** vendors — listed under "New vendors" with enum, orgs, confidence, website
+# MAGIC - **LEGIT + normalized name** — the same bullet also requests `{vendor_name_raw}` as a
+# MAGIC   `VENDOR_ALIASES` entry so the exact Coralogix log string stops reappearing
+# MAGIC - **Duplicate alias candidates** — listed under "Aliases" as `raw → duplicate_of`
+# MAGIC
+# MAGIC Every row in the batch gets the same `jira_ticket`, which the batch PR reuses as its
+# MAGIC lead ticket. There is no per-vendor ticket path.
 # MAGIC
 # MAGIC **Safety:** requires `CREATE_TICKETS=True`. Default scope is `current_run`
 # MAGIC (`pipeline_run_id = RUN_ID`) so resume/VERIFY runs cannot flood Jira with the
 # MAGIC historical backlog. Use `TICKETS_SCOPE=all_pending` only when intentionally
-# MAGIC clearing the backlog. Skips rows that already have `jira_ticket`.
+# MAGIC clearing the backlog. Skips rows that already have `jira_ticket`. Fewer than
+# MAGIC `MIN_BATCH_SIZE` qualifying rows → no ticket at all (batch-only policy).
 # MAGIC Uses credentials from the `vendor-validation-app` Databricks secret scope.
 
 # COMMAND ----------
@@ -1073,78 +1235,97 @@ def _create_ticket(summary: str, description_lines: list[str], email: str, token
     key = resp.json()["key"]
     return key, f"{JIRA_BASE_URL}/browse/{key}"
 
-def _new_vendor_ticket(row, email: str, token: str) -> tuple[str, str]:
+def _new_vendor_line(row) -> str:
+    """One bullet per new vendor — full evidence stays in Delta / the dashboard."""
     name     = row.vendor_name_raw
     official = row.official_name or name
     enum     = row.enum_name or ""
-    protos   = row.supported_protocols or "[]"
-    devices  = row.device_types or "[]"
     website  = row.website or "N/A"
-    hardware = row.hardware_evidence or "N/A"
-    note     = row.analyst_note or ""
     confidence = row.confidence_score or "?"
     orgs     = row.orgs_count or 0
 
+    line = f"- **{official}** — {enum} = \"{official}\""
+    if name.strip() != official.strip():
+        line += f" · log \"{name}\""
+    line += f" · {orgs} org(s) · confidence {confidence} · {website}"
+    if row.should_add_alias and name.strip() != official.strip():
+        # Without the raw log string as an alias, production keeps firing the warning.
+        line += f" · also alias \"{name}\""
+    return line
+
+def _alias_line(row) -> str:
+    """One bullet per alias-only lead."""
+    raw   = row.vendor_name_raw
+    canon = row.duplicate_of or row.official_name or "?"
+    score = round((row.duplicate_score or 0) * 100, 1)
+    gate  = row.duplicate_gate or "?"
+    orgs  = row.orgs_count or 0
+    return f"- \"{raw}\" → **{canon}** — {score}% ({gate}) · {orgs} org(s)"
+
+# Jira caps a description field at ~32k chars; an all_pending backlog batch would blow
+# past that and fail ticket creation for the whole run. Truncate the listing instead —
+# the batch PR body and Delta always carry the full set.
+TICKET_MAX_LISTED = 60
+TICKET_ALIAS_RESERVE = 15   # keep room for aliases when new vendors would eat the budget
+
+def _batch_ticket(rows, email: str, token: str, *, run_id: str, scope: str) -> tuple[str, str]:
+    """Create the single NET ticket that covers this run's whole batch.
+
+    The pipeline is batch-only: one ticket per run, shared by every row in the batch and
+    reused as the lead ticket for the batch PR.
+    """
+    new_rows   = [r for r in rows if r.status == "COMPLETED"]
+    alias_rows = [r for r in rows if r.status != "COMPLETED"]
+
+    alias_reserve = min(len(alias_rows), TICKET_ALIAS_RESERVE)
+    new_shown     = new_rows[: max(0, TICKET_MAX_LISTED - alias_reserve)]
+    alias_shown   = alias_rows[: TICKET_MAX_LISTED - len(new_shown)]
+
+    def _more(shown: list, total: list) -> list[str]:
+        hidden = len(total) - len(shown)
+        if hidden <= 0:
+            return []
+        return [
+            f"- … and **{hidden} more** — full list in the batch PR and in "
+            f"`coralogix_vendor_candidates` for run `{run_id}`"
+        ]
+
     lines = [
-        f"Adding **{official}** to the medigator vendor registry.",
-        f"Detected in Coralogix logs across **{orgs} org(s)**.",
+        f"Batch of **{len(rows)} vendor lead(s)** from the Coralogix Vendor Verifier pipeline.",
+        f"**{len(new_rows)}** new vendor(s), **{len(alias_rows)}** alias(es).",
         "",
-        f"**AI Verdict:** LEGIT  **Confidence:** {confidence}",
-        f"**Website:** {website}",
-        f"**Hardware Evidence:** {hardware}",
-        f"**Protocols:** {protos}",
-        f"**Device Types:** {devices}",
+        f"**Run ID:** `{run_id}`  **Scope:** {scope}",
+        "",
+        "One batch PR to medigator `staging` covers every change below.",
     ]
-    if note:
-        lines += ["", f"**Analyst Note:** {note}"]
+
+    if new_rows:
+        lines += ["", "---", f"**New vendors ({len(new_rows)})**", ""]
+        lines += [_new_vendor_line(row) for row in new_shown]
+        lines += _more(new_shown, new_rows)
+
+    if alias_rows:
+        lines += ["", "---", f"**Aliases ({len(alias_rows)})**", ""]
+        lines += [_alias_line(row) for row in alias_shown]
+        lines += _more(alias_shown, alias_rows)
+
     lines += [
         "",
         "---",
         "**Files to modify:**",
         "",
-        f"- `medigator/common/domain_model/xiot/device.py` — add `{enum} = \"{official}\"` to `Vendor` enum",
-        f"- `medigator/common/domain_model/intels/vulnerabilities/types.py` — add `{enum} = \"{official}\"` to `VulnerabilityRelevanceSource` and `manufacturer_sources`",
+        "- `medigator/common/domain_model/xiot/device.py` — new `Vendor` enum members above "
+        "`# Vendors from manuf file #`, plus the `VENDOR_ALIASES` entries listed above",
+        "- `medigator/common/domain_model/intels/vulnerabilities/types.py` — matching "
+        "`VulnerabilityRelevanceSource` members and `manufacturer_sources` entries "
+        "(new vendors only; aliases need no change)",
     ]
-    if row.should_add_alias and name.strip() != official.strip():
-        lines += [
-            "",
-            f"**Also add alias** (Coralogix logs the raw string `{name}` — without this alias "
-            f"the warning will keep firing):",
-            "",
-            f"- `medigator/common/domain_model/xiot/device.py` — add `\"{name}\"` to the "
-            f"`VENDOR_ALIASES` entry for `Vendor.{enum}` (`\"{official}\"`)",
-        ]
-    return _create_ticket(
-        f"[Vendor Verifier] Add new vendor: {official}",
-        lines, email, token,
-    )
 
-def _alias_ticket(row, email: str, token: str) -> tuple[str, str]:
-    raw      = row.vendor_name_raw
-    canon    = row.duplicate_of
-    score    = round((row.duplicate_score or 0) * 100, 1)
-    gate     = row.duplicate_gate or "?"
-    orgs     = row.orgs_count or 0
-    official = row.official_name or ""
-
-    lines = [
-        f"**{raw}** appears in Coralogix logs ({orgs} org(s)) and is a known alias for **{canon}**.",
-        "",
-        f"**Match:** {score}% ({gate})",
-    ]
-    if official and official.lower() != raw.lower():
-        lines.append(f"**AI Official Name:** {official}")
-    lines += [
-        "",
-        "---",
-        "**Action required:**",
-        "",
-        f"- `medigator/common/domain_model/xiot/device.py` — add `\"{raw}\"` to the `VENDOR_ALIASES` entry for `Vendor` value `\"{canon}\"`",
-    ]
-    return _create_ticket(
-        f"[Vendor Verifier] Add alias: {raw!r} → {canon}",
-        lines, email, token,
+    summary = (
+        f"[Vendor Verifier] Batch: {len(new_rows)} new vendor(s) + "
+        f"{len(alias_rows)} alias(es)"
     )
+    return _create_ticket(summary, lines, email, token)
 
 # ── Run ticket creation ───────────────────────────────────────────────────────
 STAGE = "CREATE_TICKETS"
@@ -1169,20 +1350,28 @@ else:
         else:
             print(
                 "  ⚠️  TICKETS_SCOPE=all_pending — will ticket the full backlog "
-                "(every LEGIT / alias row with no jira_ticket)."
+                "(every P1-eligible LEGIT / alias row with no jira_ticket)."
             )
 
+        conf_list = ", ".join(f"'{c}'" for c in sorted(AUTO_PR_CONFIDENCES))
         pending = spark.sql(f"""
             SELECT
                 vendor_name_raw, status, verdict, official_name, enum_name,
                 confidence_score, website, hardware_evidence, networking_proof,
                 supported_protocols, device_types, industries, analyst_note,
                 duplicate_of, duplicate_score, duplicate_gate, orgs_count, should_add_alias,
-                pipeline_run_id
+                pipeline_run_id, distinct_companies_found, is_original_manufacturer,
+                parent_company, alternative_companies
             FROM {CANDIDATES_TABLE}
             WHERE jira_ticket IS NULL
               AND (
-                   (status = 'COMPLETED' AND verdict = 'LEGIT')
+                   (
+                        status = 'COMPLETED'
+                    AND verdict = 'LEGIT'
+                    AND confidence_score IN ({conf_list})
+                    AND COALESCE(distinct_companies_found, 1) = 1
+                    AND (is_original_manufacturer IS NULL OR is_original_manufacturer = true)
+                   )
                 OR (status = 'DUPLICATE' AND should_add_alias = true)
               )
               {scope_filter}
@@ -1190,7 +1379,7 @@ else:
         """).collect()
 
         # Preview before any Jira writes (operator can cancel the run if count looks wrong)
-        print(f"  {len(pending)} vendor(s) need a ticket under scope={TICKETS_SCOPE!r}")
+        print(f"  {len(pending)} vendor(s) qualify for the batch under scope={TICKETS_SCOPE!r}")
         for row in pending[:20]:
             kind = "new vendor" if row.status == "COMPLETED" else "alias"
             print(
@@ -1200,29 +1389,35 @@ else:
         if len(pending) > 20:
             print(f"    ... and {len(pending) - 20} more")
 
-        tickets_created = 0
-        for row in pending:
-            try:
-                if row.status == "COMPLETED":
-                    key, url = _new_vendor_ticket(row, email, token)
-                    kind = "new vendor"
-                else:
-                    key, url = _alias_ticket(row, email, token)
-                    kind = "alias"
-
-                _set_jira_ticket(row.vendor_name_raw, key)
-                print(f"  ✅ {key}  [{kind}]  {row.vendor_name_raw!r}  → {url}")
-                tickets_created += 1
-                time.sleep(0.5)   # Jira rate limit
-
-            except Exception as ticket_exc:
-                print(f"  ⚠️  Failed to create ticket for '{row.vendor_name_raw}': {ticket_exc}")
-
-        log_ok(
-            STAGE,
-            rows_out=tickets_created,
-            message=f"{tickets_created}/{len(pending)} tickets created (scope={TICKETS_SCOPE})",
-        )
+        if len(pending) < MIN_BATCH_SIZE:
+            # Batch-only: never open a ticket for a single vendor. Rows keep
+            # jira_ticket = NULL and roll into the next run's batch.
+            print(
+                f"  Held back — {len(pending)} qualifying vendor(s) < MIN_BATCH_SIZE="
+                f"{MIN_BATCH_SIZE}. No ticket created; rows stay pending for the next run."
+            )
+            log_ok(
+                STAGE,
+                rows_out=0,
+                message=(
+                    f"held back: {len(pending)} qualifying row(s) < "
+                    f"MIN_BATCH_SIZE={MIN_BATCH_SIZE} (scope={TICKETS_SCOPE})"
+                ),
+            )
+        else:
+            key, url = _batch_ticket(
+                pending, email, token, run_id=RUN_ID, scope=TICKETS_SCOPE
+            )
+            _set_batch_jira_ticket([r.vendor_name_raw for r in pending], key)
+            print(f"  ✅ {key}  batch of {len(pending)} vendor(s)  → {url}")
+            log_ok(
+                STAGE,
+                rows_out=len(pending),
+                message=(
+                    f"batch ticket {key} covers {len(pending)} vendor(s) "
+                    f"(scope={TICKETS_SCOPE})"
+                ),
+            )
 
     except Exception as exc:
         log_fail(STAGE, exc, traceback.format_exc())
@@ -1234,6 +1429,9 @@ else:
 # MAGIC
 # MAGIC Set `CREATE_PR = True` after reviewing Delta for mega backfill.
 # MAGIC Weekly `RUN_MODE` sets this automatically. Uses `vendor_verifier_batch_pr.py`.
+# MAGIC
+# MAGIC Opens **one** PR for every row that has a batch ticket and no `pr_url` yet. Fewer than
+# MAGIC `MIN_BATCH_SIZE` qualifying rows → no PR; they roll into the next run's batch.
 
 # COMMAND ----------
 
@@ -1256,11 +1454,19 @@ else:
             PR_MODE,
             auto_pr_confidences=AUTO_PR_CONFIDENCES,
             get_secret=_dbutils_secret,
+            min_batch_size=MIN_BATCH_SIZE,
         )
         if pr_url:
             log_ok(STAGE, rows_out=1, message=pr_url)
         else:
-            log_ok(STAGE, rows_out=0, message="no rows qualified for batch PR")
+            log_ok(
+                STAGE,
+                rows_out=0,
+                message=(
+                    "no batch opened — fewer than "
+                    f"MIN_BATCH_SIZE={MIN_BATCH_SIZE} rows qualified"
+                ),
+            )
     except Exception as exc:
         log_fail(STAGE, exc, traceback.format_exc())
 

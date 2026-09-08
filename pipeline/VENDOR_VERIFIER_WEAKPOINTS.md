@@ -193,7 +193,7 @@ Add to the prompt and `VALID_VERDICTS`:
 | `LEGIT` | Original manufacturer of network-connected hardware | new vendor |
 | `NOT-MANUFACTURER` | Real company — distributor, reseller, integrator, retailer, assembler | review queue, no PR |
 | `BRAND-OF` | Trades under a parent/owner; requires `parent_company` | resolve parent (P2) |
-| `AMBIGUOUS` | String matches ≥2 distinct companies; requires `alternative_companies` | review queue, no PR |
+| `AMBIGUOUS` | String matches ≥2 distinct companies; requires `alternative_companies` | same candidates table + dashboard section; no Jira/PR |
 | `GENERIC` | Product category, acronym, model number — not a company at all | drop, no PR |
 | `SOFTWARE-ONLY` / `SUSPICIOUS` | unchanged | dashboard only |
 
@@ -251,5 +251,8 @@ SOFTWARE-ONLY / SUSPICIOUS Gate 2 duplicates no longer queue alias PRs.
    manufacturer. Which is right determines drop-vs-alias.
 3. **`MEDION`** — Gemini says no OT/medical evidence, which would make it out of scope regardless of
    the Lenovo relationship. Is consumer-only hardware in scope for the `Vendor` enum at all?
-4. Should `AMBIGUOUS` leads auto-open a research ticket, or stay silent on the dashboard?
+4. ~~Should `AMBIGUOUS` leads auto-open a research ticket, or stay silent on the dashboard?~~
+   **Answered (Aug 2026):** same `coralogix_vendor_candidates` table (`verdict=AMBIGUOUS` +
+   `alternative_companies` JSON); **no** auto research ticket; add a Lakeview dashboard section.
+   Human curator still picks company + postfix when ready.
 5. Finding 10 — is the missing `ctd` / `lansweeper` coverage expected for this batch?
